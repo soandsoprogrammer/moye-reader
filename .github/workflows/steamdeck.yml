@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: steamdeck-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -23,13 +27,26 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+          sudo apt-get install -y pkg-config libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 mesa-vulkan-drivers xvfb xauth
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Run tests
         run: cargo test --release --locked
       - name: Build portable package
         run: sh scripts/build-steamdeck.sh
+      - name: Smoke test the packaged reader
+        run: |
+          mkdir -p "${RUNNER_TEMP}/moye-smoke/runtime"
+          chmod 700 "${RUNNER_TEMP}/moye-smoke/runtime"
+          cd "${RUNNER_TEMP}/moye-smoke"
+          tar -xzf "${GITHUB_WORKSPACE}/dist/MoYe-SteamDeck-x86_64.tar.gz"
+          printf '第一章\n\n掌机阅读检查。\n' > smoke-test.txt
+          status=0
+          xvfb-run -a --server-args='-screen 0 1280x800x24' \
+            env -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$PWD/runtime" \
+            MOYE_DATA_DIR="$PWD/library" timeout 12s ./MoYe/launch-moye.sh smoke-test.txt || status=$?
+          test "$status" -eq 124
+          grep -q '"title":"smoke-test"' library/library.json
       - uses: actions/upload-artifact@v4
         with:
           name: MoYe-SteamDeck-x86_64
