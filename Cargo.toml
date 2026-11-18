@@ -1,0 +1,29 @@
+[package]
+name = "moye-reader"
+version = "0.5.0"
+edition = "2024"
+description = "墨页 · A native local TXT and EPUB reader"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+dirs = "6"
+encoding_rs = "0.8"
+gpui-kit = "=0.10.0"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+percent-encoding = "2"
+regex = "1"
+roxmltree = "0.21"
+scraper = { version = "0.24", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = "1"
+tempfile = "3"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
