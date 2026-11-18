@@ -31,6 +31,12 @@ pub enum Screen {
     Reading,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadingPanel {
+    Contents,
+    Notes,
+}
+
 #[derive(Clone)]
 pub struct Editor {
     pub id: Option<u64>,
@@ -66,6 +72,8 @@ pub struct Reader {
     pub pending_scroll_anchor: Option<Anchor>,
     pub source_list: ListState,
     pub screen: Screen,
+    pub handheld: bool,
+    pub handheld_panel: Option<ReadingPanel>,
     pub contents_scroll: UniformListScrollHandle,
     pub shelf_scene: Option<Arc<RenderImage>>,
     pub tab: Tab,
@@ -94,7 +102,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(files: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        files: Vec<PathBuf>,
+        handheld: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (store, library, notice) =
             match Store::new().and_then(|store| store.load().map(|library| (store, library))) {
                 Ok((store, library)) => (Some(store), library, None),
@@ -140,6 +153,8 @@ impl Reader {
             pending_scroll_anchor: None,
             source_list: ListState::new(0, ListAlignment::Top, px(180.)),
             screen: Screen::Library,
+            handheld,
+            handheld_panel: None,
             contents_scroll: UniformListScrollHandle::new(),
             shelf_scene: None,
             tab: Tab::Source,
@@ -223,11 +238,48 @@ impl Reader {
     }
 
     pub fn is_paged(&self) -> bool {
-        self.library.settings.reading_mode != ReadingMode::Scroll
+        self.reading_mode() != ReadingMode::Scroll
     }
 
     pub fn is_spread(&self) -> bool {
-        self.library.settings.reading_mode == ReadingMode::Spread
+        self.reading_mode() == ReadingMode::Spread
+    }
+
+    pub fn reading_mode(&self) -> ReadingMode {
+        if self.handheld {
+            self.library.settings.handheld_reading_mode
+        } else {
+            self.library.settings.reading_mode
+        }
+    }
+
+    pub fn panel_open(&self, panel: ReadingPanel) -> bool {
+        if self.handheld {
+            return self.handheld_panel == Some(panel);
+        }
+        match panel {
+            ReadingPanel::Contents => self.library.settings.sidebar_open,
+            ReadingPanel::Notes => self.library.settings.notes_open,
+        }
+    }
+
+    pub fn set_panel(&mut self, panel: ReadingPanel, open: bool, cx: &mut Context<Self>) {
+        if self.handheld {
+            if open {
+                self.handheld_panel = Some(panel);
+                self.settings_open = false;
+                self.source_popup = None;
+            } else if self.handheld_panel == Some(panel) {
+                self.handheld_panel = None;
+            }
+            cx.notify();
+        } else {
+            match panel {
+                ReadingPanel::Contents => self.library.settings.sidebar_open = open,
+                ReadingPanel::Notes => self.library.settings.notes_open = open,
+            }
+            self.save_now(cx);
+        }
     }
 
     pub fn pages_per_turn(&self) -> usize {
@@ -512,6 +564,7 @@ impl Reader {
     }
 
     fn close_reader_overlays(&mut self) {
+        self.handheld_panel = None;
         self.source_popup = None;
         self.settings_open = false;
         self.selection = None;
@@ -700,6 +753,7 @@ impl Reader {
             return;
         }
         self.show_position(position, cx);
+        self.handheld_panel = None;
         self.capture_position();
         self.save_now(cx);
     }
@@ -854,7 +908,9 @@ impl Reader {
                 .bookmarks
                 .push(mark);
             self.tab = Tab::Bookmarks;
-            self.library.settings.notes_open = true;
+            if !self.handheld {
+                self.library.settings.notes_open = true;
+            }
             self.save_now(cx);
             if !self.dirty {
                 self.tell("已添加书签", false, window, cx);
@@ -950,7 +1006,9 @@ impl Reader {
             ));
         }
         self.tab = Tab::Personal;
-        self.library.settings.notes_open = true;
+        if !self.handheld {
+            self.library.settings.notes_open = true;
+        }
         self.save_now(cx);
     }
 
@@ -1070,9 +1128,13 @@ impl Reader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.library.settings.reading_mode != mode && !self.busy && self.editor.is_none() {
+        if self.reading_mode() != mode && !self.busy && self.editor.is_none() {
             let position = self.current_position();
-            self.library.settings.reading_mode = mode;
+            if self.handheld {
+                self.library.settings.handheld_reading_mode = mode;
+            } else {
+                self.library.settings.reading_mode = mode;
+            }
             self.pagination = None;
             self.show_position(position, cx);
             self.focus.focus(window, cx);

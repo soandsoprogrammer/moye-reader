@@ -6,6 +6,8 @@
 
 macOS Apple 芯片版位于 `dist/墨页.app`，也可解压 `dist/墨页-macOS-arm64.zip` 后在 Finder 双击打开。打开后进入书库，点击书籍即可开始或继续阅读。首次启动可以打开带脚注的试读《雾岸来信》。
 
+可从 [GitHub Releases](https://github.com/soandsoprogrammer/moye-reader/releases/latest) 下载发行包。
+
 用 Rust 与 Xcode Command Line Tools 重新构建：
 
 ```sh
@@ -15,6 +17,24 @@ cargo test --locked
 ```
 
 也可以在命令行里直接指定一本书，例如 `cargo run --locked -- "/path/to/book.epub"`。
+
+## Steam Deck
+
+在桌面模式解压 `MoYe-SteamDeck-x86_64.tar.gz`，运行其中的 `MoYe/launch-moye.sh`。数据会保存到用户目录；发行包附带 Noto 中文字体。若想从游戏模式启动，把这个启动脚本 [添加为非 Steam 游戏](https://help.steampowered.com/en/faqs/view/671A-4453-E8D2-323C/)。
+
+掌机布局默认单页翻页，目录和批注作为侧边栏按需弹出。可用触屏或触控板打开书籍、选中文字和点开注标。导入书籍可在桌面模式完成，也可将 TXT 或 EPUB 路径作为参数传给启动脚本。
+
+在 Steam Input 中可使用键盘鼠标布局，并按下表绑定常用按键。应用也响应这些键盘按键。
+
+| 掌机按键 | 映射到 | 操作 |
+| --- | --- | --- |
+| L1 / R1 | Page Up / Page Down | 前后翻页 |
+| 方向键 | 方向键 | 左右翻页，在书库移动焦点 |
+| A / B | Enter / Esc | 打开或继续阅读 / 返回 |
+| X / Y | B / T | 切换书签 / 阅读设置 |
+| 背键 | C / N | 打开目录 / 批注 |
+
+macOS 可用 `cargo run --locked -- --handheld` 预览同一布局。Steam Deck 包由 GitHub Actions 在 x86_64 Linux 上运行 `scripts/build-steamdeck.sh` 生成。
 
 ## 阅读和批注
 

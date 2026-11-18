@@ -113,6 +113,7 @@ pub struct Reading {
 #[serde(default)]
 pub struct Settings {
     pub reading_mode: ReadingMode,
+    pub handheld_reading_mode: ReadingMode,
     pub paper: Paper,
     pub size: u16,
     pub notes_open: bool,
@@ -123,6 +124,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             reading_mode: ReadingMode::Scroll,
+            handheld_reading_mode: ReadingMode::Paged,
             paper: Paper::Warm,
             size: 19,
             notes_open: true,

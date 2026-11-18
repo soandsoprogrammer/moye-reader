@@ -11,8 +11,22 @@ use crate::{
 impl Reader {
     pub fn shelf_page(&self, window: &Window, p: Palette, cx: &Context<Self>) -> Div {
         let size = window.viewport_size();
-        let width = (size.width - px(88.)).min(px(1120.));
-        let columns = if width >= px(1000.) { 4 } else { 3 };
+        let gutter = if self.handheld { px(22.) } else { px(44.) };
+        let width = (size.width - gutter * 2.).min(px(1120.));
+        let columns = if width >= px(1000.) {
+            4
+        } else if width >= px(720.) || !self.handheld {
+            3
+        } else {
+            2
+        };
+        let banner_height = if self.handheld && size.height < px(640.) {
+            144.
+        } else if size.height < px(690.) {
+            198.
+        } else {
+            255.
+        };
         let book_count = self.library.books.len() + 1;
         let show_drop_tile = self.library.books.is_empty();
         let rows = (book_count + usize::from(show_drop_tile)).div_ceil(columns);
@@ -72,7 +86,7 @@ impl Reader {
             .flex()
             .flex_col()
             .items_center()
-            .px(px(44.))
+            .px(gutter)
             .child(
                 div()
                     .w_full()
@@ -81,19 +95,14 @@ impl Reader {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .pt(px(27.))
+                    .pt(px(if self.handheld { 18. } else { 27. }))
                     .child(
                         label("书库", 30., p.ink)
                             .font_weight(FontWeight::SEMIBOLD)
                             .line_height(px(38.))
                             .mb(px(16.)),
                     )
-                    .child(self.featured_card(
-                        featured,
-                        if size.height < px(690.) { 198. } else { 255. },
-                        p,
-                        cx,
-                    ))
+                    .child(self.featured_card(featured, banner_height, p, cx))
                     .child(
                         div()
                             .mt(px(26.))
@@ -247,6 +256,7 @@ impl Reader {
             .tab_stop(true)
             .aria_label(format!("阅读 {}", info.title))
             .hover(|this| this.bg(rgb(p.hover)).border_color(rgb(0x688878)))
+            .focus_visible(|this| this.bg(rgb(p.hover)).border_color(rgb(0x688878)))
             .child(thumbnail)
             .child(
                 div()

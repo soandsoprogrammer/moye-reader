@@ -7,7 +7,7 @@ use gpui_kit::{
 use crate::{
     book::{Link, PointInText, Target},
     library::{Annotation, Bookmark, Paper, ReadingMode, Tone},
-    reader::{Reader, Screen, Tab},
+    reader::{Reader, ReadingPanel, Screen, Tab},
     style::{self, *},
 };
 
@@ -36,6 +36,7 @@ pub(crate) fn button_style(id: impl Into<ElementId>, color: u32, hover: u32) -> 
         .focusable()
         .tab_stop(true)
         .hover(move |this| this.bg(rgb(hover)))
+        .focus_visible(move |this| this.bg(rgb(hover)))
 }
 
 fn icon_control(
@@ -129,10 +130,10 @@ impl Render for Reader {
         let right = if slim { px(241.) } else { px(285.) };
         let main = if reading {
             let mut width = viewport.width;
-            if self.library.settings.sidebar_open {
+            if !self.handheld && self.panel_open(ReadingPanel::Contents) {
                 width -= left;
             }
-            if self.library.settings.notes_open {
+            if !self.handheld && self.panel_open(ReadingPanel::Notes) {
                 width -= right;
             }
             self.sync_pagination(
@@ -156,6 +157,9 @@ impl Render for Reader {
             .bg(rgb(p.paper))
             .text_color(rgb(p.ink))
             .text_size(px(13.))
+            .when(cfg!(target_os = "linux"), |root| {
+                root.font_family("Noto Sans CJK SC")
+            })
             .flex()
             .flex_col()
             .on_key_down(cx.listener(Self::key_down))
@@ -169,6 +173,9 @@ impl Render for Reader {
             }))
             .child(self.top_bar(p, cx))
             .child(main)
+            .when_some(self.handheld_panel.filter(|_| reading), |root, panel| {
+                root.child(self.handheld_drawer(panel, p, cx))
+            })
             .when(reading && self.source_popup.is_some(), |root| {
                 root.child(self.source_popup_view(window, p, cx))
             })
@@ -205,9 +212,10 @@ impl Reader {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .when(self.library.settings.sidebar_open, |row| {
-                row.child(self.contents_panel(left, p, cx))
-            })
+            .when(
+                !self.handheld && self.panel_open(ReadingPanel::Contents),
+                |row| row.child(self.contents_panel(left, p, cx)),
+            )
             .child(
                 div()
                     .flex()
@@ -218,9 +226,42 @@ impl Reader {
                     .child(self.page(p, window, cx))
                     .child(self.footer(p, cx)),
             )
-            .when(self.library.settings.notes_open, |row| {
-                row.child(self.notes_panel(right, p, cx))
-            })
+            .when(
+                !self.handheld && self.panel_open(ReadingPanel::Notes),
+                |row| row.child(self.notes_panel(right, p, cx)),
+            )
+    }
+
+    fn handheld_drawer(&self, panel: ReadingPanel, p: Palette, cx: &mut Context<Self>) -> Div {
+        let width = px(288.);
+        let drawer = div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(width)
+            .shadow_lg()
+            .occlude();
+        let drawer = match panel {
+            ReadingPanel::Contents => drawer.left_0().child(self.contents_panel(width, p, cx)),
+            ReadingPanel::Notes => drawer.right_0().child(self.notes_panel(width, p, cx)),
+        };
+        div()
+            .absolute()
+            .top(TOP_HEIGHT)
+            .bottom(FOOTER_HEIGHT)
+            .w_full()
+            .child(
+                div()
+                    .id("dismiss-handheld-drawer")
+                    .absolute()
+                    .inset_0()
+                    .bg(rgba(0x121b1554))
+                    .occlude()
+                    .on_click(
+                        cx.listener(move |reader, _, _, cx| reader.set_panel(panel, false, cx)),
+                    ),
+            )
+            .child(drawer)
     }
 
     fn top_bar(&self, p: Palette, cx: &Context<Self>) -> Div {
@@ -247,6 +288,7 @@ impl Reader {
             .bg(rgb(p.button))
             .px(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
+            .when(self.handheld, |el| el.h(px(44.)))
             .child(icon(ADD, 15., p.white))
             .child(if self.busy {
                 "正在载入…"
@@ -298,13 +340,21 @@ impl Reader {
                     .items_center()
                     .gap(px(4.))
                     .child(
-                        nav_item("open-library", "书库", LIBRARY, !reading, p).on_click(
-                            cx.listener(|reader, _, window, cx| reader.open_library(window, cx)),
-                        ),
+                        nav_item("open-library", "书库", LIBRARY, !reading, p)
+                            .on_click(
+                                cx.listener(|reader, _, window, cx| {
+                                    reader.open_library(window, cx)
+                                }),
+                            )
+                            .when(self.handheld, |el| el.h(px(44.))),
                     )
-                    .child(nav_item("open-reader", "阅读", BOOK, reading, p).on_click(
-                        cx.listener(|reader, _, window, cx| reader.open_reader(window, cx)),
-                    )),
+                    .child(
+                        nav_item("open-reader", "阅读", BOOK, reading, p)
+                            .on_click(
+                                cx.listener(|reader, _, window, cx| reader.open_reader(window, cx)),
+                            )
+                            .when(self.handheld, |el| el.h(px(44.))),
+                    ),
             )
             .child(middle)
             .when(!reading, |bar| bar.child(import))
@@ -314,12 +364,14 @@ impl Reader {
     fn reading_actions(&self, p: Palette, cx: &Context<Self>) -> Div {
         let settings = control("reading-settings", p)
             .aria_label("阅读设置")
+            .when(self.handheld, |el| el.h(px(44.)))
             .when(self.settings_open, |el| el.bg(rgb(p.green_bg)))
             .child(icon(TYPE, 17., p.green))
             .child("阅读设置")
             .on_click(cx.listener(|reader, _, _, cx| {
                 reader.anchor = None;
                 reader.source_popup = None;
+                reader.handheld_panel = None;
                 reader.settings_open = !reader.settings_open;
                 cx.notify();
             }));
@@ -335,6 +387,7 @@ impl Reader {
             marked,
             p,
         )
+        .when(self.handheld, |el| el.size(px(44.)))
         .on_click(cx.listener(|reader, _, window, cx| reader.toggle_bookmark(window, cx)));
         div()
             .flex()
@@ -358,12 +411,13 @@ impl Reader {
                     "toggle-sidebar",
                     PANEL_LEFT,
                     "显示或隐藏目录",
-                    self.library.settings.sidebar_open,
+                    self.panel_open(ReadingPanel::Contents),
                     p,
                 )
+                .when(self.handheld, |el| el.size(px(44.)))
                 .on_click(cx.listener(|reader, _, _, cx| {
-                    reader.library.settings.sidebar_open = !reader.library.settings.sidebar_open;
-                    reader.save_now(cx);
+                    let panel = ReadingPanel::Contents;
+                    reader.set_panel(panel, !reader.panel_open(panel), cx);
                 })),
             )
             .child(settings)
@@ -373,12 +427,13 @@ impl Reader {
                     "toggle-notes",
                     PANEL_RIGHT,
                     "显示或隐藏批注",
-                    self.library.settings.notes_open,
+                    self.panel_open(ReadingPanel::Notes),
                     p,
                 )
+                .when(self.handheld, |el| el.size(px(44.)))
                 .on_click(cx.listener(|reader, _, _, cx| {
-                    reader.library.settings.notes_open = !reader.library.settings.notes_open;
-                    reader.save_now(cx);
+                    let panel = ReadingPanel::Notes;
+                    reader.set_panel(panel, !reader.panel_open(panel), cx);
                 })),
             )
     }
@@ -492,6 +547,7 @@ impl Reader {
         };
         let previous = control("previous", p)
             .px(px(8.))
+            .when(self.handheld, |el| el.h(px(44.)).px(px(12.)))
             .aria_label(previous_title)
             .child(icon(LEFT, 15., p.soft))
             .child(previous_title)
@@ -499,6 +555,7 @@ impl Reader {
             .on_click(cx.listener(|reader, _, _, cx| reader.turn(false, cx)));
         let next = control("next", p)
             .px(px(8.))
+            .when(self.handheld, |el| el.h(px(44.)).px(px(12.)))
             .aria_label(next_title)
             .child(next_title)
             .child(icon(RIGHT, 15., p.soft))
@@ -593,8 +650,7 @@ impl Reader {
             .child(
                 icon_control("close-notes", CLOSE, "关闭批注栏", false, p).on_click(cx.listener(
                     |reader, _, _, cx| {
-                        reader.library.settings.notes_open = false;
-                        reader.save_now(cx);
+                        reader.set_panel(ReadingPanel::Notes, false, cx);
                     },
                 )),
             );
@@ -1132,11 +1188,9 @@ impl Reader {
                     ]
                     .into_iter()
                     .map(|(id, mode, title)| {
-                        segment(id, title, self.library.settings.reading_mode == mode, p).on_click(
-                            cx.listener(move |reader, _, window, cx| {
-                                reader.set_reading_mode(mode, window, cx)
-                            }),
-                        )
+                        segment(id, title, self.reading_mode() == mode, p).on_click(cx.listener(
+                            move |reader, _, window, cx| reader.set_reading_mode(mode, window, cx),
+                        ))
                     }),
                 ),
             )
@@ -1409,6 +1463,10 @@ impl Reader {
             cx.stop_propagation();
             return;
         }
+        if self.handheld && !modifiers.modified() && self.handheld_key(key, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if self.screen != Screen::Reading {
             return;
         }
@@ -1432,6 +1490,53 @@ impl Reader {
             _ => return,
         }
         cx.stop_propagation();
+    }
+
+    fn handheld_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if key == "f11" {
+            window.toggle_fullscreen();
+            return true;
+        }
+        if self.screen == Screen::Library {
+            match key {
+                "left" | "up" => window.focus_prev(cx),
+                "right" | "down" => window.focus_next(cx),
+                "enter" if self.focus.is_focused(window) && !self.busy => {
+                    self.open_reader(window, cx);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        match key {
+            "escape" if self.source_popup.take().is_some() => cx.notify(),
+            "escape" if std::mem::take(&mut self.settings_open) => cx.notify(),
+            "escape" if self.handheld_panel.take().is_some() => cx.notify(),
+            "escape" if self.selection.take().is_some() => {
+                self.anchor = None;
+                cx.notify();
+            }
+            "escape" => self.open_library(window, cx),
+            "c" | "n" => {
+                let panel = if key == "c" {
+                    ReadingPanel::Contents
+                } else {
+                    ReadingPanel::Notes
+                };
+                self.set_panel(panel, !self.panel_open(panel), cx);
+            }
+            "b" => self.toggle_bookmark(window, cx),
+            "t" => {
+                self.handheld_panel = None;
+                self.source_popup = None;
+                self.settings_open = !self.settings_open;
+                cx.notify();
+            }
+            "up" if self.handheld_panel.is_some() => window.focus_prev(cx),
+            "down" if self.handheld_panel.is_some() => window.focus_next(cx),
+            _ => return false,
+        }
+        true
     }
 }
 

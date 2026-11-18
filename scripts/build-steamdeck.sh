@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
+    printf '%s\n' '请在 x86_64 Linux 上构建 Steam Deck 版。' >&2
+    exit 1
+fi
+
+cd "$(dirname "$0")/.."
+cargo build --release --locked
+
+stage=$(mktemp -d)
+trap 'rm -rf "$stage"' EXIT
+app="$stage/MoYe"
+mkdir -p "$app/fonts" dist
+install -m 755 "${CARGO_TARGET_DIR:-target}/release/moye-reader" "$app/moye-reader"
+install -m 755 scripts/launch-moye.sh "$app/launch-moye.sh"
+install -m 644 README.md "$app/README.md"
+
+download_font() {
+    upstream="https://raw.githubusercontent.com/notofonts/noto-cjk/$1/$2"
+    curl --fail --silent --show-error --location --retry 3 \
+        "$upstream/OTF/SimplifiedChinese/$3" --output "$app/fonts/$3"
+    curl --fail --silent --show-error --location --retry 3 \
+        "$upstream/LICENSE" --output "$app/fonts/$2-LICENSE.txt"
+}
+download_font Sans2.004 Sans NotoSansCJKsc-Regular.otf
+download_font Serif2.003 Serif NotoSerifCJKsc-Regular.otf
+tar -C "$stage" -czf dist/MoYe-SteamDeck-x86_64.tar.gz MoYe
