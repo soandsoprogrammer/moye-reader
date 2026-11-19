@@ -86,6 +86,7 @@ fn segment(id: &'static str, text: impl Into<SharedString>, selected: bool, p: P
                 .border_color(rgb(p.line))
         })
         .when(!selected, |el| el.hover(|el| el.bg(rgb(p.hover))))
+        .focus_visible(|el| el.bg(rgb(p.hover)).text_color(rgb(p.ink)))
         .child(text.into())
 }
 
@@ -241,6 +242,9 @@ impl Reader {
             .bottom_0()
             .w(width)
             .shadow_lg()
+            .tab_index(0)
+            .tab_group()
+            .track_focus(&self.handheld_controls)
             .occlude();
         let drawer = match panel {
             ReadingPanel::Contents => drawer.left_0().child(self.contents_panel(width, p, cx)),
@@ -1165,8 +1169,11 @@ impl Reader {
             .child(
                 icon_control("close-settings", CLOSE, "关闭阅读设置", false, p)
                     .size(px(26.))
-                    .on_click(cx.listener(|reader, _, _, cx| {
+                    .on_click(cx.listener(|reader, _, window, cx| {
                         reader.settings_open = false;
+                        if reader.handheld {
+                            reader.focus.focus(window, cx);
+                        }
                         cx.notify();
                     })),
             );
@@ -1177,6 +1184,11 @@ impl Reader {
             .w(px(266.))
             .p(px(14.))
             .shadow_lg()
+            .when(self.handheld, |el| {
+                el.tab_index(0)
+                    .tab_group()
+                    .track_focus(&self.handheld_controls)
+            })
             .occlude()
             .child(heading)
             .child(label("阅读方式", 12., p.dim).mt(px(9.)).mb(px(6.)))
@@ -1511,8 +1523,14 @@ impl Reader {
         }
         match key {
             "escape" if self.source_popup.take().is_some() => cx.notify(),
-            "escape" if std::mem::take(&mut self.settings_open) => cx.notify(),
-            "escape" if self.handheld_panel.take().is_some() => cx.notify(),
+            "escape" if std::mem::take(&mut self.settings_open) => {
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            "escape" if self.handheld_panel.take().is_some() => {
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
             "escape" if self.selection.take().is_some() => {
                 self.anchor = None;
                 cx.notify();
@@ -1524,24 +1542,50 @@ impl Reader {
                 } else {
                     ReadingPanel::Notes
                 };
-                self.set_panel(panel, !self.panel_open(panel), cx);
+                let open = !self.panel_open(panel);
+                self.set_panel(panel, open, cx);
+                if !open {
+                    self.focus.focus(window, cx);
+                }
             }
             "b" => self.toggle_bookmark(window, cx),
             "left" | "up" if self.handheld_panel.is_some() || self.settings_open => {
-                window.focus_prev(cx)
+                self.move_handheld_focus(false, window, cx);
             }
             "right" | "down" if self.handheld_panel.is_some() || self.settings_open => {
-                window.focus_next(cx)
+                self.move_handheld_focus(true, window, cx);
             }
             "t" => {
                 self.handheld_panel = None;
                 self.source_popup = None;
                 self.settings_open = !self.settings_open;
+                if !self.settings_open {
+                    self.focus.focus(window, cx);
+                }
                 cx.notify();
             }
             _ => return false,
         }
         true
+    }
+
+    fn move_handheld_focus(&self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.handheld_controls.contains_focused(window, cx) {
+            self.handheld_controls.focus(window, cx);
+            window.focus_next(cx);
+            return;
+        }
+        let previous = window.focused(cx);
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
+        }
+        if !self.handheld_controls.contains_focused(window, cx)
+            && let Some(previous) = previous
+        {
+            previous.focus(window, cx);
+        }
     }
 }
 
