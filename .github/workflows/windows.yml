@@ -1,0 +1,90 @@
+name: Windows handheld package
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.*'
+      - 'assets/**'
+      - 'scripts/build-windows.ps1'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag for attaching a verified package'
+        type: string
+      build_run:
+        description: 'Successful Windows build run ID for that tag'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: inputs.release_tag == '' && inputs.build_run == ''
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Windows tests
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+      - name: Build portable package
+        run: ./scripts/build-windows.ps1
+      - name: Smoke test the packaged reader
+        run: |
+          $testRoot = Join-Path $env:RUNNER_TEMP 'moye-smoke'
+          Expand-Archive dist/MoYe-Windows-x64.zip $testRoot
+          $env:MOYE_DATA_DIR = Join-Path $testRoot 'library'
+          $book = Join-Path $testRoot 'WindowsSmoke.txt'
+          Set-Content $book "第一章`n`n掌机阅读检查。" -Encoding utf8
+          $state = Join-Path $env:MOYE_DATA_DIR 'library.json'
+          $log = Join-Path $testRoot 'stderr.txt'
+          $reader = Start-Process (Join-Path $testRoot 'MoYe/MoYe.exe') -ArgumentList ('"{0}"' -f $book) -PassThru -RedirectStandardError $log
+          try {
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($reader.HasExited) { throw "Reader exited: $($reader.ExitCode)" }
+              if ((Test-Path $state) -and (Select-String -Path $state -SimpleMatch '"title":"WindowsSmoke"')) {
+                break
+              }
+              Start-Sleep -Milliseconds 250
+            }
+            Start-Sleep -Seconds 1
+            if ($reader.HasExited -or !(Test-Path $state) -or !(Select-String -Path $state -SimpleMatch '"title":"WindowsSmoke"')) {
+              throw 'The packaged reader did not finish opening the test book.'
+            }
+          } finally {
+            if (!$reader.HasExited) { Stop-Process -Id $reader.Id }
+            Get-Content $log
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MoYe-Windows-x64
+          path: dist/MoYe-Windows-x64.zip
+          if-no-files-found: error
+
+  attach:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && inputs.build_run != ''
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      TAG: ${{ inputs.release_tag }}
+      BUILD_RUN: ${{ inputs.build_run }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Verify build and tag refer to the same commit
+        run: |
+          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          expected="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          actual="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq 'select(.conclusion=="success" and .path==".github/workflows/windows.yml") | .head_sha')"
+          test "$expected" = "$actual"
+      - uses: actions/download-artifact@v4
+        with:
+          name: MoYe-Windows-x64
+          run-id: ${{ inputs.build_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload the verified package
+        run: gh release upload "$TAG" "MoYe-Windows-x64.zip#Windows x64 掌机版" --repo "$GITHUB_REPOSITORY"

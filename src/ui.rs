@@ -157,9 +157,10 @@ impl Render for Reader {
             .bg(rgb(p.paper))
             .text_color(rgb(p.ink))
             .text_size(px(13.))
-            .when(cfg!(target_os = "linux"), |root| {
-                root.font_family("Noto Sans CJK SC")
-            })
+            .when(
+                cfg!(any(target_os = "linux", target_os = "windows")),
+                |root| root.font_family("Noto Sans CJK SC"),
+            )
             .flex()
             .flex_col()
             .on_key_down(cx.listener(Self::key_down))
@@ -380,9 +381,9 @@ impl Reader {
             "bookmark-current",
             if marked { BOOKMARKED } else { BOOKMARK },
             if marked {
-                "移除此处书签（⌘D）"
+                "移除此处书签"
             } else {
-                "添加书签（⌘D）"
+                "添加书签"
             },
             marked,
             p,
@@ -1526,14 +1527,18 @@ impl Reader {
                 self.set_panel(panel, !self.panel_open(panel), cx);
             }
             "b" => self.toggle_bookmark(window, cx),
+            "left" | "up" if self.handheld_panel.is_some() || self.settings_open => {
+                window.focus_prev(cx)
+            }
+            "right" | "down" if self.handheld_panel.is_some() || self.settings_open => {
+                window.focus_next(cx)
+            }
             "t" => {
                 self.handheld_panel = None;
                 self.source_popup = None;
                 self.settings_open = !self.settings_open;
                 cx.notify();
             }
-            "up" if self.handheld_panel.is_some() => window.focus_prev(cx),
-            "down" if self.handheld_panel.is_some() => window.focus_next(cx),
             _ => return false,
         }
         true

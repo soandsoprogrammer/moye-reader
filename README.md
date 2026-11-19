@@ -18,6 +18,22 @@ cargo test --locked
 
 也可以在命令行里直接指定一本书，例如 `cargo run --locked -- "/path/to/book.epub"`。
 
+## Windows 掌机
+
+解压 `MoYe-Windows-x64.zip` 后打开 `MoYe.exe`。Windows 版默认使用掌机布局，附带 Noto 中文字体。桌面布局可用 `MoYe.exe --desktop` 启动。把 TXT 或 EPUB 拖到窗口即可导入，书库也可以用「导入书籍」。
+
+把掌机的控制模式切到手柄模式，应用会识别 Windows 的 XInput 手柄。
+
+| 按键 | 操作 |
+| --- | --- |
+| LB / RB | 上一页 / 下一页 |
+| 方向键 | 左右翻页，或在书库、目录和设置中选择 |
+| A / B | 确认或继续阅读 / 返回 |
+| X / Y | 切换书签 / 阅读设置 |
+| View / Menu | 目录 / 批注 |
+
+F11 可切换全屏。Windows 的书库数据位于 `%LOCALAPPDATA%\Moye Reader`。
+
 ## Steam Deck
 
 在桌面模式解压 `MoYe-SteamDeck-x86_64.tar.gz`，运行其中的 `MoYe/launch-moye.sh`。数据会保存到用户目录；发行包附带 Noto 中文字体。若想从游戏模式启动，把这个启动脚本 [添加为非 Steam 游戏](https://help.steampowered.com/en/faqs/view/671A-4453-E8D2-323C/)。

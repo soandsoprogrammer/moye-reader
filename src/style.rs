@@ -147,8 +147,6 @@ impl Palette {
 
 pub const SERIF: &str = if cfg!(target_os = "macos") {
     "Songti SC"
-} else if cfg!(target_os = "windows") {
-    "SimSun"
 } else {
     "Noto Serif CJK SC"
 };

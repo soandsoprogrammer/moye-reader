@@ -1,6 +1,6 @@
 [package]
 name = "moye-reader"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "墨页 · A native local TXT and EPUB reader"
 
@@ -20,6 +20,9 @@ serde_json = "1"
 smallvec = "1"
 tempfile = "3"
 zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_XboxController"] }
 
 [profile.dev]
 debug = 0

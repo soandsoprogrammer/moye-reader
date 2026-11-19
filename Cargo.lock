@@ -3833,7 +3833,7 @@ dependencies = [
 
 [[package]]
 name = "moye-reader"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3849,6 +3849,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tempfile",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

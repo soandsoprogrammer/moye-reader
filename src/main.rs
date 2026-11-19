@@ -1,4 +1,11 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod book;
+#[cfg(any(target_os = "windows", test))]
+mod controller;
 mod demo;
 mod epub;
 mod epub_style;
@@ -22,7 +29,7 @@ use gpui_kit::*;
 actions!(moye, [Quit]);
 
 fn main() {
-    let mut handheld = false;
+    let mut handheld = cfg!(target_os = "windows");
     let mut files = Vec::new();
     let mut options = true;
     for arg in std::env::args_os().skip(1) {
@@ -30,12 +37,14 @@ fn main() {
             options = false;
         } else if options && arg == "--handheld" {
             handheld = true;
+        } else if options && arg == "--desktop" {
+            handheld = false;
         } else if !options || !arg.to_string_lossy().starts_with("-psn_") {
             files.push(PathBuf::from(arg));
         }
     }
     application().with_assets(assets::AllAssets).run(move |cx| {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         load_bundled_fonts(cx);
         init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -60,10 +69,10 @@ fn main() {
         };
         let bounds = Bounds::centered(None, preferred, cx);
         let window = WindowOptions {
-            window_bounds: Some(if handheld && cfg!(target_os = "linux") {
-                WindowBounds::Fullscreen(bounds)
-            } else {
-                WindowBounds::Windowed(bounds)
+            window_bounds: Some(match (handheld, std::env::consts::OS) {
+                (true, "linux") => WindowBounds::Fullscreen(bounds),
+                (true, "windows") => WindowBounds::Maximized(bounds),
+                _ => WindowBounds::Windowed(bounds),
             }),
             window_min_size: Some(minimum),
             titlebar: Some(TitlebarOptions {
@@ -74,15 +83,19 @@ fn main() {
             app_id: Some("app.moye.reader".to_owned()),
             ..Default::default()
         };
-        open_window(window, cx, |window, cx| {
+        let (_window, _reader) = open_window(window, cx, |window, cx| {
             cx.new(|cx| reader::Reader::new(files, handheld, window, cx))
         })
         .expect("无法打开墨页窗口");
+        #[cfg(target_os = "windows")]
+        if handheld {
+            controller::listen(_window, cx);
+        }
         cx.activate(true);
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn load_bundled_fonts(cx: &mut App) {
     let Ok(executable) = std::env::current_exe() else {
         return;
