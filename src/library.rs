@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -7,16 +7,21 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use moye_plugin_api::MAX_BOOK_BYTES as MAX_BOOK;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    book::{Book, BookInfo, DEMO_ID, Format, Passage, parse_txt},
+    book::{Book, BookInfo, DEMO_ID, Format, Passage, PointInText, parse_txt},
     demo,
     epub::parse_epub,
 };
 
-const MAX_BOOK: u64 = 256 * 1024 * 1024;
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ShelfFolder {
+    pub id: u64,
+    pub name: String,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Paper {
@@ -107,6 +112,54 @@ pub struct Reading {
     pub position: Position,
     pub annotations: Vec<Annotation>,
     pub bookmarks: Vec<Bookmark>,
+    glyph_anchors: bool,
+}
+
+impl Reading {
+    pub fn migrate_glyph_anchors(&mut self, book: &Book) {
+        if std::mem::replace(&mut self.glyph_anchors, true) {
+            return;
+        }
+        let remap = |section: usize, item: usize, byte| {
+            book.sections.get(section)?.remap_legacy_point(PointInText {
+                block: item.checked_sub(1)?,
+                byte,
+            })
+        };
+        if let Some(point) = remap(
+            self.position.section,
+            self.position.item,
+            self.position.byte,
+        ) {
+            if point.byte != self.position.byte {
+                self.position.offset = 0.;
+            }
+            self.position.item = point.block + 1;
+            self.position.byte = point.byte;
+        }
+        for mark in &mut self.bookmarks {
+            if let Some(point) = remap(mark.section, mark.item, mark.byte) {
+                mark.item = point.block + 1;
+                mark.byte = point.byte;
+            }
+        }
+        for note in &mut self.annotations {
+            let Some(section) = book.sections.get(note.passage.section) else {
+                continue;
+            };
+            if let (Some(start), Some(end)) = (
+                section.remap_legacy_point(note.passage.start),
+                section.remap_legacy_point(note.passage.end),
+            ) && let Some(passage) = Passage::new(note.passage.section, start, end)
+            {
+                let quote = book.quote(&passage);
+                if !quote.is_empty() {
+                    note.passage = passage;
+                    note.quote = quote;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -116,8 +169,9 @@ pub struct Settings {
     pub handheld_reading_mode: ReadingMode,
     pub paper: Paper,
     pub size: u16,
-    pub notes_open: bool,
     pub sidebar_open: bool,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub disabled_plugins: BTreeSet<String>,
 }
 
 impl Default for Settings {
@@ -127,8 +181,8 @@ impl Default for Settings {
             handheld_reading_mode: ReadingMode::Paged,
             paper: Paper::Warm,
             size: 19,
-            notes_open: true,
             sidebar_open: true,
+            disabled_plugins: BTreeSet::new(),
         }
     }
 }
@@ -141,6 +195,83 @@ pub struct Library {
     pub reading: HashMap<String, Reading>,
     pub settings: Settings,
     pub next_annotation: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<ShelfFolder>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub book_folders: HashMap<String, u64>,
+    pub next_folder: u64,
+}
+
+impl Library {
+    pub fn folder(&self, id: u64) -> Option<&ShelfFolder> {
+        self.folders.iter().find(|folder| folder.id == id)
+    }
+
+    pub fn name_folder(&mut self, id: Option<u64>, name: &str) -> Result<u64> {
+        let name = name.trim();
+        ensure!(!name.is_empty(), "请输入文件夹名称");
+        ensure!(
+            name.chars().count() <= 64 && !name.chars().any(char::is_control),
+            "名称最多 64 个字符，且不能包含换行等控制字符"
+        );
+        let normalized = name.to_lowercase();
+        ensure!(
+            !self.folders.iter().any(|folder| {
+                Some(folder.id) != id && folder.name.to_lowercase() == normalized
+            }),
+            "已有同名文件夹"
+        );
+        if let Some(id) = id {
+            let folder = self
+                .folders
+                .iter_mut()
+                .find(|folder| folder.id == id)
+                .context("找不到这个文件夹")?;
+            folder.name = name.to_owned();
+            return Ok(id);
+        }
+        let greatest = self
+            .folders
+            .iter()
+            .map(|folder| folder.id)
+            .max()
+            .unwrap_or_default();
+        let id = self
+            .next_folder
+            .max(greatest)
+            .checked_add(1)
+            .context("无法分配文件夹编号")?;
+        self.next_folder = id;
+        self.folders.push(ShelfFolder {
+            id,
+            name: name.to_owned(),
+        });
+        Ok(id)
+    }
+
+    pub fn move_books(&mut self, books: &HashSet<String>, folder: Option<u64>) -> Result<()> {
+        ensure!(
+            self.books
+                .iter()
+                .filter(|info| books.contains(&info.id))
+                .count()
+                == books.len(),
+            "所选书籍已发生变化"
+        );
+        if let Some(id) = folder {
+            ensure!(self.folder(id).is_some(), "找不到这个文件夹");
+            self.book_folders
+                .extend(books.iter().map(|book| (book.clone(), id)));
+        } else {
+            self.book_folders.retain(|id, _| !books.contains(id));
+        }
+        Ok(())
+    }
+
+    pub fn remove_folder(&mut self, id: u64) {
+        self.folders.retain(|folder| folder.id != id);
+        self.book_folders.retain(|_, folder| *folder != id);
+    }
 }
 
 #[derive(Clone)]
@@ -155,6 +286,10 @@ impl Store {
             .or_else(|| dirs::data_local_dir().map(|root| root.join("Moye Reader")))
             .context("系统未提供应用数据目录")?;
         Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     fn books_dir(&self) -> PathBuf {
@@ -174,6 +309,18 @@ impl Store {
         };
         let mut data: Library = serde_json::from_reader(file).context("书库记录无法读取")?;
         data.settings.size = data.settings.size.clamp(15, 31);
+        let folders = data
+            .folders
+            .iter()
+            .map(|folder| folder.id)
+            .collect::<std::collections::HashSet<_>>();
+        let books = data
+            .books
+            .iter()
+            .map(|book| book.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        data.book_folders
+            .retain(|book, folder| folders.contains(folder) && books.contains(book.as_str()));
         let lower_bound = data
             .reading
             .values()

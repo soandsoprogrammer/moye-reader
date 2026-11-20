@@ -13,9 +13,12 @@ mod epub_style;
 mod library;
 mod pictures;
 mod reader;
+mod shelf_folders;
 mod shelf_view;
 
 mod pagination;
+mod plugin_view;
+mod plugins;
 mod reading_view;
 mod style;
 #[cfg(test)]
@@ -75,10 +78,12 @@ fn main() {
                 _ => WindowBounds::Windowed(bounds),
             }),
             window_min_size: Some(minimum),
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
             titlebar: Some(TitlebarOptions {
                 title: Some("墨页".into()),
                 appears_transparent: cfg!(target_os = "macos"),
-                traffic_light_position: Some(point(px(17.), px(21.))),
+                traffic_light_position: cfg!(target_os = "macos")
+                    .then(|| ui::traffic_light_position(reader::Screen::Library)),
             }),
             app_id: Some("app.moye.reader".to_owned()),
             ..Default::default()

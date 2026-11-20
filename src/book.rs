@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Range, sync::LazyLock};
+use std::{collections::HashMap, num::NonZeroUsize, ops::Range, sync::LazyLock};
 
 use anyhow::{Result, bail};
 use encoding_rs::{GB18030, UTF_16BE, UTF_16LE};
@@ -13,13 +13,6 @@ pub enum Format {
 }
 
 impl Format {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Txt => "TXT",
-            Self::Epub => "EPUB",
-        }
-    }
-
     pub fn extension(self) -> &'static str {
         match self {
             Self::Txt => "txt",
@@ -102,6 +95,7 @@ pub struct Inline {
     pub note_kind: Option<NoteKind>,
     pub color: Option<u32>,
     pub link: Option<Link>,
+    pub glyph: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +125,7 @@ pub struct Block {
     pub text: SharedString,
     pub kind: BlockKind,
     pub spans: Vec<Span>,
+    pub quote_group: Option<NonZeroUsize>,
 }
 
 impl Block {
@@ -149,6 +144,29 @@ pub struct Section {
     pub header: Option<usize>,
     pub notes: Vec<Target>,
     pub note_locations: HashMap<Target, usize>,
+    pub legacy_rows: Vec<LegacyRow>,
+}
+
+#[derive(Clone, Copy)]
+pub struct LegacyRow {
+    pub start: PointInText,
+    pub len: usize,
+}
+
+impl Section {
+    pub fn remap_legacy_point(&self, point: PointInText) -> Option<PointInText> {
+        let row = self.legacy_rows.get(point.block)?;
+        let mut block = row.start.block;
+        let mut byte = row.start.byte + point.byte.min(row.len);
+        loop {
+            let text = &self.blocks.get(block)?.text;
+            if byte <= text.len() {
+                return Some(PointInText { block, byte });
+            }
+            byte -= text.len();
+            block += 1;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -247,6 +265,68 @@ impl Book {
         }
         self.prefix.push(total);
         self.linear = linear;
+    }
+
+    pub fn contents_index(&self, section: usize, block: usize) -> Option<usize> {
+        let local = || {
+            self.contents
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.section == section)
+        };
+        if let Some((index, _)) = local()
+            .filter(|(_, entry)| entry.block <= block)
+            .max_by_key(|(_, entry)| entry.block)
+            .or_else(|| local().min_by_key(|(_, entry)| entry.block))
+        {
+            return Some(index);
+        }
+        self.linear.binary_search(&section).ok()?;
+        self.contents
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.section < section && self.linear.binary_search(&entry.section).is_ok()
+            })
+            .max_by_key(|(_, entry)| (entry.section, entry.block))
+            .map(|(index, _)| index)
+    }
+
+    pub fn title_at(&self, section: usize, block: usize) -> SharedString {
+        if let Some(index) = self.contents_index(section, block) {
+            self.contents[index].title.clone()
+        } else {
+            let title = &self.sections[section].title;
+            if title.is_empty() {
+                self.info.title.clone().into()
+            } else {
+                title.clone()
+            }
+        }
+    }
+
+    pub fn neighboring_chapter(
+        &self,
+        section: usize,
+        block: usize,
+        forward: bool,
+    ) -> Option<&ContentsEntry> {
+        let Some(index) = self.contents_index(section, block) else {
+            return if forward {
+                self.contents.iter().find(|entry| entry.section > section)
+            } else {
+                None
+            };
+        };
+        let current = &self.contents[index];
+        let another = |entry: &&ContentsEntry| {
+            (entry.section, entry.block) != (current.section, current.block)
+        };
+        if forward {
+            self.contents[index + 1..].iter().find(another)
+        } else {
+            self.contents[..index].iter().rev().find(another)
+        }
     }
 
     pub fn progress(&self, section: usize, item: usize, byte: usize, at_end: bool) -> f32 {

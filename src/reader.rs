@@ -16,6 +16,9 @@ use crate::{
     library::{Annotation, Bookmark, Library, Paper, Position, ReadingMode, Store, Tone},
     pagination::{Anchor, Pagination, page_range},
     pictures::{Picture, read_picture, read_shelf_scene},
+    plugin_view::{PluginPage, SourcesPanel},
+    shelf_folders::ShelfDialog,
+    shelf_view::ShelfPress,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,12 +32,18 @@ pub enum Tab {
 pub enum Screen {
     Library,
     Reading,
+    Plugins,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ReadingPanel {
     Contents,
     Notes,
+}
+
+pub enum NotePopup {
+    Source(Target),
+    Personal(u64),
 }
 
 #[derive(Clone)]
@@ -50,6 +59,7 @@ pub struct Drag {
     pub end: PointInText,
     pub origin: Point<Pixels>,
     pub link: Option<Link>,
+    pub annotation: Option<u64>,
     pub moved: bool,
 }
 
@@ -73,13 +83,20 @@ pub struct Reader {
     pub source_list: ListState,
     pub screen: Screen,
     pub handheld: bool,
-    pub handheld_panel: Option<ReadingPanel>,
+    pub reading_drawer: Option<ReadingPanel>,
     pub handheld_controls: FocusHandle,
     pub contents_scroll: UniformListScrollHandle,
     pub shelf_scene: Option<Arc<RenderImage>>,
+    pub(crate) shelf_folder: Option<u64>,
+    pub(crate) shelf_dialog: Option<ShelfDialog>,
+    pub(crate) shelf_selecting: bool,
+    pub(crate) shelf_selected: HashSet<String>,
+    pub(crate) shelf_press: Option<ShelfPress>,
+    pub(crate) shelf_skip_click: Option<String>,
     pub tab: Tab,
     pub source: Option<Target>,
-    pub source_popup: Option<(Target, Point<Pixels>)>,
+    pub note_popup: Option<(NotePopup, Point<Pixels>)>,
+    pub titlebar_press: Option<Point<Pixels>>,
     pub drag: Option<Drag>,
     pub selection: Option<Passage>,
     pub anchor: Option<Point<Pixels>>,
@@ -92,9 +109,11 @@ pub struct Reader {
     pub focus: FocusHandle,
     pub notice: Option<(String, bool)>,
     pub busy: bool,
+    pub(crate) sources: Option<SourcesPanel>,
+    pub(crate) plugin_page: Option<PluginPage>,
     picking: bool,
     pictures: HashMap<String, HashMap<String, ImageState>>,
-    store: Option<Store>,
+    pub(crate) store: Option<Store>,
     dirty: bool,
     save_task: Option<Task<()>>,
     notice_task: Option<Task<()>>,
@@ -155,13 +174,20 @@ impl Reader {
             source_list: ListState::new(0, ListAlignment::Top, px(180.)),
             screen: Screen::Library,
             handheld,
-            handheld_panel: None,
+            reading_drawer: None,
             handheld_controls: cx.focus_handle(),
             contents_scroll: UniformListScrollHandle::new(),
             shelf_scene: None,
+            shelf_folder: None,
+            shelf_dialog: None,
+            shelf_selecting: false,
+            shelf_selected: HashSet::new(),
+            shelf_press: None,
+            shelf_skip_click: None,
             tab: Tab::Source,
             source: None,
-            source_popup: None,
+            note_popup: None,
+            titlebar_press: None,
             drag: None,
             selection: None,
             anchor: None,
@@ -174,6 +200,8 @@ impl Reader {
             focus,
             notice,
             busy: false,
+            sources: None,
+            plugin_page: None,
             picking: false,
             pictures: HashMap::new(),
             store,
@@ -202,6 +230,8 @@ impl Reader {
         })
         .detach();
         cx.on_app_quit(|reader, _| {
+            reader.sources = None;
+            reader.plugin_page = None;
             reader.capture_position();
             reader.flush();
             async {}
@@ -210,6 +240,8 @@ impl Reader {
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, app| {
             let _ = weak.update(app, |reader, _| {
+                reader.sources = None;
+                reader.plugin_page = None;
                 reader.capture_position();
                 reader.flush();
             });
@@ -256,31 +288,35 @@ impl Reader {
     }
 
     pub fn panel_open(&self, panel: ReadingPanel) -> bool {
-        if self.handheld {
-            return self.handheld_panel == Some(panel);
-        }
-        match panel {
-            ReadingPanel::Contents => self.library.settings.sidebar_open,
-            ReadingPanel::Notes => self.library.settings.notes_open,
+        if panel == ReadingPanel::Contents && !self.handheld {
+            self.library.settings.sidebar_open
+        } else {
+            self.reading_drawer == Some(panel)
         }
     }
 
     pub fn set_panel(&mut self, panel: ReadingPanel, open: bool, cx: &mut Context<Self>) {
-        if self.handheld {
+        if panel == ReadingPanel::Contents && !self.handheld {
+            self.library.settings.sidebar_open = open;
+            self.save_now(cx);
+        } else {
             if open {
-                self.handheld_panel = Some(panel);
+                self.reading_drawer = Some(panel);
                 self.settings_open = false;
-                self.source_popup = None;
-            } else if self.handheld_panel == Some(panel) {
-                self.handheld_panel = None;
+                self.note_popup = None;
+                self.anchor = None;
+            } else if self.reading_drawer == Some(panel) {
+                self.reading_drawer = None;
             }
             cx.notify();
-        } else {
-            match panel {
-                ReadingPanel::Contents => self.library.settings.sidebar_open = open,
-                ReadingPanel::Notes => self.library.settings.notes_open = open,
-            }
-            self.save_now(cx);
+        }
+        if open
+            && panel == ReadingPanel::Contents
+            && let Some(index) =
+                self.contents_entry(self.section, self.visible_item().saturating_sub(1))
+        {
+            self.contents_scroll
+                .scroll_to_item(index, ScrollStrategy::Nearest);
         }
     }
 
@@ -299,17 +335,16 @@ impl Reader {
     }
 
     pub fn can_turn(&self, forward: bool) -> bool {
-        let pages = self.visible_pages();
-        if self.is_paged()
-            && if forward {
-                pages.end < self.page_count()
-            } else {
-                pages.start > 0
-            }
-        {
-            return true;
+        if !self.is_paged() {
+            return self.chapter_neighbor(forward).is_some();
         }
-        self.neighbor(forward).is_some()
+        let pages = self.visible_pages();
+        let in_section = if forward {
+            pages.end < self.page_count()
+        } else {
+            pages.start > 0
+        };
+        in_section || self.neighbor(forward).is_some()
     }
 
     pub fn visible_item(&self) -> usize {
@@ -387,7 +422,7 @@ impl Reader {
         if self.is_paged() {
             return;
         }
-        self.source_popup = None;
+        self.note_popup = None;
         self.capture_position();
         self.schedule_save(window, cx);
         cx.notify();
@@ -485,6 +520,16 @@ impl Reader {
     }
 
     pub fn import_paths(&mut self, paths: Vec<PathBuf>, window: &Window, cx: &mut Context<Self>) {
+        self.import_files(paths, None, window, cx);
+    }
+
+    pub(crate) fn import_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        download_dir: Option<tempfile::TempDir>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if paths.is_empty() || self.busy {
             return;
         }
@@ -493,12 +538,17 @@ impl Reader {
             return;
         };
         self.capture_position();
+        self.sources = None;
+        let folder = (self.screen == Screen::Library)
+            .then_some(self.shelf_folder)
+            .flatten();
         self.busy = true;
         self.notice = None;
         cx.notify();
         cx.spawn_in(window, async move |weak, cx| {
             let (mut books, last, errors) = cx
                 .background_spawn(async move {
+                    let _download_dir = download_dir;
                     let mut books = vec![];
                     let mut last = None;
                     let mut errors = vec![];
@@ -527,6 +577,12 @@ impl Reader {
                     .collect();
                 let mut seen = existing;
                 books.retain(|book| seen.insert(book.id.clone()));
+                if let Some(folder) = folder.filter(|id| reader.library.folder(*id).is_some()) {
+                    reader
+                        .library
+                        .book_folders
+                        .extend(books.iter().map(|book| (book.id.clone(), folder)));
+                }
                 reader.library.books.extend(books);
                 if let Some(book) = last {
                     reader.activate(book, true, window, cx);
@@ -542,11 +598,14 @@ impl Reader {
 
     pub fn open_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screen == Screen::Library {
+            if self.shelf_folder.is_some() {
+                self.show_shelf_folder(None, window, cx);
+            }
             return;
         }
         self.capture_position();
         self.flush();
-        self.screen = Screen::Library;
+        self.set_screen(Screen::Library, window);
         Theme::change(ThemeMode::Dark, None, cx);
         self.close_reader_overlays();
         self.focus.focus(window, cx);
@@ -554,7 +613,7 @@ impl Reader {
     }
 
     pub fn open_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.screen = Screen::Reading;
+        self.set_screen(Screen::Reading, window);
         Theme::change(theme(self.library.settings.paper), None, cx);
         self.focus.focus(window, cx);
         if !self.busy && self.library.active.as_deref() != Some(self.book.info.id.as_str()) {
@@ -565,9 +624,22 @@ impl Reader {
         }
     }
 
+    pub(crate) fn set_screen(&mut self, screen: Screen, window: &mut Window) {
+        if self.screen != screen {
+            self.sources = None;
+            self.plugin_page = None;
+            self.shelf_dialog = None;
+            self.clear_shelf_selection();
+            self.screen = screen;
+            if cfg!(target_os = "macos") {
+                window.set_traffic_light_position(crate::ui::traffic_light_position(screen));
+            }
+        }
+    }
+
     fn close_reader_overlays(&mut self) {
-        self.handheld_panel = None;
-        self.source_popup = None;
+        self.reading_drawer = None;
+        self.note_popup = None;
         self.settings_open = false;
         self.selection = None;
         self.drag = None;
@@ -632,13 +704,18 @@ impl Reader {
             *info = book.info.clone();
         }
         self.book = Arc::new(book);
+        self.library
+            .reading
+            .entry(self.book.info.id.clone())
+            .or_default()
+            .migrate_glyph_anchors(&self.book);
         self.pagination = None;
         self.restore_annotation_links();
         self.back.clear();
         self.contents_scroll = UniformListScrollHandle::new();
         self.close_reader_overlays();
         if open {
-            self.screen = Screen::Reading;
+            self.set_screen(Screen::Reading, window);
         }
         if self.screen == Screen::Reading {
             Theme::change(theme(self.library.settings.paper), None, cx);
@@ -659,18 +736,26 @@ impl Reader {
     }
 
     pub fn contents_entry(&self, section: usize, block: usize) -> Option<usize> {
-        let entries = || {
-            self.book
-                .contents
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.section == section)
+        self.book.contents_index(section, block)
+    }
+
+    pub fn chapter_title(&self) -> SharedString {
+        self.book
+            .title_at(self.section, self.visible_item().saturating_sub(1))
+    }
+
+    pub fn page_count_is_chapter(&self) -> bool {
+        let Some(index) = self.contents_entry(self.section, 0) else {
+            return false;
         };
-        entries()
-            .filter(|(_, entry)| entry.block <= block)
-            .max_by_key(|(_, entry)| entry.block)
-            .or_else(|| entries().next())
-            .map(|(index, _)| index)
+        let entry = &self.book.contents[index];
+        entry.section == self.section
+            && entry.block == 0
+            && self.contents_entry(self.section, self.data().blocks.len().saturating_sub(1))
+                == Some(index)
+            && self
+                .neighbor(true)
+                .is_none_or(|next| self.contents_entry(next, 0) != Some(index))
     }
 
     fn show_position(&mut self, pos: Position, cx: &mut Context<Self>) {
@@ -689,7 +774,7 @@ impl Reader {
         self.drag = None;
         self.anchor = None;
         self.source = None;
-        self.source_popup = None;
+        self.note_popup = None;
         self.revealed = None;
         let item = pos.item.min(self.data().blocks.len());
         let byte = item
@@ -755,15 +840,21 @@ impl Reader {
             return;
         }
         self.show_position(position, cx);
-        self.handheld_panel = None;
+        self.reading_drawer = None;
         self.capture_position();
         self.save_now(cx);
     }
 
     pub fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if let Some(section) = self.neighbor(forward) {
-            self.navigate(section, 0, cx);
+        if let Some((section, block)) = self.chapter_neighbor(forward) {
+            self.navigate(section, block, cx);
         }
+    }
+
+    fn chapter_neighbor(&self, forward: bool) -> Option<(usize, usize)> {
+        self.book
+            .neighboring_chapter(self.section, self.visible_item().saturating_sub(1), forward)
+            .map(|entry| (entry.section, entry.block))
     }
 
     pub fn turn(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -805,25 +896,18 @@ impl Reader {
     }
 
     pub fn neighbor(&self, forward: bool) -> Option<usize> {
-        match self.book.linear.iter().position(|ix| *ix == self.section) {
-            Some(index) if forward => self.book.linear.get(index + 1).copied(),
-            Some(index) => index
-                .checked_sub(1)
-                .and_then(|i| self.book.linear.get(i).copied()),
-            None => self
-                .book
-                .linear
-                .iter()
-                .copied()
-                .find(|ix| *ix > self.section)
-                .or_else(|| self.book.linear.last().copied()),
-        }
+        let next = match self.book.linear.binary_search(&self.section) {
+            Ok(index) if forward => index + 1,
+            Ok(index) | Err(index) if !forward => index.checked_sub(1)?,
+            Ok(index) | Err(index) => index,
+        };
+        self.book.linear.get(next).copied()
     }
 
     pub fn follow(&mut self, link: Link, window: &Window, cx: &mut Context<Self>) {
         match link {
             Link::Local(target) if self.book.notes.contains_key(&target) => {
-                self.source_popup = Some((target, window.mouse_position()));
+                self.note_popup = Some((NotePopup::Source(target), window.mouse_position()));
                 cx.notify();
             }
             Link::Local(target) => {
@@ -910,9 +994,6 @@ impl Reader {
                 .bookmarks
                 .push(mark);
             self.tab = Tab::Bookmarks;
-            if !self.handheld {
-                self.library.settings.notes_open = true;
-            }
             self.save_now(cx);
             if !self.dirty {
                 self.tell("已添加书签", false, window, cx);
@@ -1008,9 +1089,6 @@ impl Reader {
             ));
         }
         self.tab = Tab::Personal;
-        if !self.handheld {
-            self.library.settings.notes_open = true;
-        }
         self.save_now(cx);
     }
 

@@ -19,6 +19,171 @@ fn info(format: Format) -> BookInfo {
 }
 
 #[test]
+fn mixed_reading_text_keeps_inline_code_in_its_own_font() {
+    use crate::{
+        book::{Block, Inline, Span},
+        reading_view::reading_font_overrides,
+    };
+    let mut block = Block::paragraph("此 EPUB 用 e\u{301} 和 code 排版。");
+    let code = block.text.find("code").unwrap();
+    block.spans.push(Span {
+        range: code..code + 4,
+        style: Inline {
+            code: true,
+            ..Inline::default()
+        },
+    });
+    let overrides = reading_font_overrides(&block);
+    let runs = overrides
+        .iter()
+        .map(|(range, font)| (block.text[range.clone()].trim(), font.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(runs, [("code", "Menlo")]);
+    assert!(reading_font_overrides(&Block::paragraph("EPUB files")).is_empty());
+}
+
+#[test]
+fn shelf_folders_round_trip_and_keep_reading_records_when_removed() {
+    let mut library: Library = serde_json::from_str("{}").unwrap();
+    let book = info(Format::Txt);
+    let key = book.id.clone();
+    library.books.push(book);
+    library
+        .reading
+        .entry(key.clone())
+        .or_default()
+        .position
+        .item = 3;
+    assert!(library.folders.is_empty() && library.book_folders.is_empty());
+
+    let folder = library.name_folder(None, " Classics ").unwrap();
+    assert!(library.name_folder(None, "classics").is_err());
+    let mut another = info(Format::Epub);
+    another.id = "1".repeat(64);
+    let selection = [key.clone(), another.id.clone()].into_iter().collect();
+    assert!(library.move_books(&selection, Some(folder)).is_err());
+    assert!(library.book_folders.is_empty());
+    library.books.push(another);
+    assert!(library.move_books(&selection, Some(folder + 1)).is_err());
+    library.move_books(&selection, Some(folder)).unwrap();
+    library.name_folder(Some(folder), "古典小说").unwrap();
+    let snapshot = serde_json::to_string(&library).unwrap();
+    let mut reopened: Library = serde_json::from_str(&snapshot).unwrap();
+    assert_eq!(reopened.folder(folder).unwrap().name, "古典小说");
+    assert_eq!(reopened.book_folders.get(&key), Some(&folder));
+    assert_eq!(reopened.book_folders.len(), 2);
+
+    reopened.remove_folder(folder);
+    assert!(!reopened.book_folders.contains_key(&key));
+    assert_eq!(reopened.books.len(), 2);
+    assert_eq!(reopened.books[0].id, key);
+    assert_eq!(reopened.reading[&key].position.item, 3);
+    assert!(reopened.name_folder(None, "诗词").unwrap() > folder);
+}
+
+#[test]
+fn footnote_labels_can_be_raised_without_shrinking_annotated_words() {
+    use crate::reading_view::is_note_marker_label;
+
+    for label in ["[674]", "〔注〕", "［１２］", "(a)", "†"] {
+        assert!(is_note_marker_label(label), "{label}");
+    }
+    for text in ["[]", "老剥皮", "〔校勘：另见旧刻〕", "See note 12"] {
+        assert!(!is_note_marker_label(text), "{text}");
+    }
+}
+
+#[test]
+fn epub_gaiji_join_the_parent_paragraph_and_migrate_saved_locations() {
+    use crate::{
+        book::{BlockKind, Book, Section},
+        epub::parse_page,
+        library::{Bookmark, Reading},
+    };
+    let parsed = parse_page(
+        "Text/chapter.xhtml",
+        r##"<body>
+          <blockquote>扑<img alt="造字" src="../Images/glyph.gif" style="height:1em;"/>蜡<a href="#footnote" epub:type="noteref">[19]</a>。</blockquote>
+          <p>A <img class="gaiji" alt="𫠠" src="../Images/second.gif"/> B<br/><img alt="外字" src="../Images/third.gif"/>C</p>
+          <p><img alt="地图" src="../Images/map.png" style="height:25em;"/></p>
+        </body>"##,
+    );
+    assert_eq!(parsed.blocks.len(), 3);
+    let block = &parsed.blocks[0];
+    assert_eq!(block.kind, BlockKind::Quote);
+    assert_eq!(block.text.as_ref(), "扑〓蜡[19]。");
+    let glyph = &block.spans[0];
+    assert_eq!(glyph.range, 3..6);
+    assert_eq!(glyph.style.glyph.as_deref(), Some("Images/glyph.gif"));
+    assert!(block.spans[1].style.note_ref);
+    assert_eq!(parsed.blocks[1].text.as_ref(), "A 𫠠 B\n〓C");
+    assert!(matches!(parsed.blocks[2].kind, BlockKind::Image { .. }));
+
+    let book = Book::new(
+        info(Format::Epub),
+        vec![Section {
+            blocks: parsed.blocks,
+            legacy_rows: parsed.legacy_rows,
+            ..Default::default()
+        }],
+    );
+    let mut reading = Reading::default();
+    reading.position.item = 3;
+    reading.bookmarks.push(Bookmark {
+        section: 0,
+        item: 2,
+        byte: 0,
+    });
+    reading.annotations.push(Annotation::new(
+        1,
+        Passage {
+            section: 0,
+            start: PointInText { block: 2, byte: 0 },
+            end: PointInText { block: 2, byte: 3 },
+        },
+        "蜡".to_owned(),
+        "旧批注".to_owned(),
+        Tone::Amber,
+    ));
+    reading.migrate_glyph_anchors(&book);
+    assert_eq!((reading.position.item, reading.position.byte), (1, 6));
+    assert_eq!(
+        reading.bookmarks[0],
+        Bookmark {
+            section: 0,
+            item: 1,
+            byte: 3
+        }
+    );
+    assert_eq!(book.quote(&reading.annotations[0].passage), "蜡");
+    let position = reading.position;
+    reading.migrate_glyph_anchors(&book);
+    assert_eq!(reading.position, position);
+}
+
+#[test]
+fn epub_groups_paragraphs_inside_each_blockquote() {
+    use crate::{book::BlockKind, epub::parse_page};
+    let parsed = parse_page(
+        "chapter.xhtml",
+        r#"<p>诗曰：</p><blockquote><p>第一句。</p><p>第二句。</p><p>第三句。</p><p>第四句。</p></blockquote>
+           <blockquote><p>另一段引用。</p></blockquote><p>接回正文。</p>"#,
+    );
+    let poetry = &parsed.blocks[1..5];
+    let group = poetry[0].quote_group;
+    assert!(group.is_some());
+    assert!(
+        poetry
+            .iter()
+            .all(|block| block.kind == BlockKind::Quote && block.quote_group == group)
+    );
+    assert_eq!(poetry[3].text.as_ref(), "第四句。");
+    assert_ne!(parsed.blocks[5].quote_group, group);
+    assert!(parsed.blocks[5].quote_group.is_some());
+    assert_eq!(parsed.blocks[6].quote_group, None);
+}
+
+#[test]
 fn txt_reads_chinese_encodings_and_splits_large_blocks() {
     let source = format!(
         "第一章 初见\r\n春风拂面。\r\n\r\n第二章 相逢\r\n{}",
@@ -82,6 +247,62 @@ fn epub2_resolves_legacy_footnote_and_ncx() {
     assert_eq!(book.sections[0].notes.len(), 1);
     let note = &book.notes[&book.sections[0].notes[0]];
     assert_eq!(note.text.as_ref(), "旧版脚注内容。");
+}
+
+#[test]
+fn epub_toc_keeps_publication_chapters_and_spine_keeps_unlisted_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("章节.epub");
+    let mut writer = ZipWriter::new(fs::File::create(&path).unwrap());
+    for (name, text) in [
+        (
+            "META-INF/container.xml",
+            r#"<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>"#,
+        ),
+        (
+            "book.opf",
+            r#"<package><manifest>
+          <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+          <item id="poster" href="poster.xhtml" media-type="application/xhtml+xml"/>
+          <item id="chapter1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>
+          <item id="continued" href="continued.xhtml" media-type="application/xhtml+xml"/>
+          <item id="chapter2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>
+          </manifest><spine><itemref idref="poster"/><itemref idref="chapter1"/>
+          <itemref idref="continued"/><itemref idref="chapter2"/></spine></package>"#,
+        ),
+        (
+            "nav.xhtml",
+            r#"<nav epub:type="toc"><ol><li><a href="chapter1.xhtml">第一回</a></li>
+          <li><a href="chapter2.xhtml">第二回</a></li></ol></nav>"#,
+        ),
+        ("poster.xhtml", r#"<img src="poster.jpg" alt="海报"/>"#),
+        ("chapter1.xhtml", "<h1>第一回</h1><p>千里江山。</p>"),
+        ("continued.xhtml", "<p>江山未尽。</p>"),
+        ("chapter2.xhtml", "<h1>第二回</h1><p>再见群山。</p>"),
+    ] {
+        writer
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let book = parse_epub(info(Format::Epub), &path).unwrap();
+    assert_eq!(book.linear, [0, 1, 2, 3]);
+    assert!(book.sections[0].title.is_empty());
+    assert_eq!(
+        book.contents
+            .iter()
+            .map(|e| e.title.as_ref())
+            .collect::<Vec<_>>(),
+        ["第一回", "第二回"]
+    );
+    assert_eq!(book.contents_index(0, 0), None);
+    assert_eq!(book.contents_index(2, 0), Some(0));
+    assert_eq!(book.title_at(2, 0).as_ref(), "第一回");
+    assert_eq!(book.neighboring_chapter(1, 0, true).unwrap().section, 3);
+    assert_eq!(book.neighboring_chapter(0, 0, true).unwrap().section, 1);
+    assert_eq!(book.neighboring_chapter(3, 0, false).unwrap().section, 1);
 }
 
 #[test]

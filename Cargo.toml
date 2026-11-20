@@ -4,6 +4,11 @@ version = "0.7.0"
 edition = "2024"
 description = "墨页 · A native local TXT and EPUB reader"
 
+[workspace]
+members = ["plugins/sdk", "plugins/folder-source"]
+default-members = ["."]
+resolver = "3"
+
 [dependencies]
 anyhow = "1"
 blake3 = "1"
@@ -11,6 +16,7 @@ dirs = "6"
 encoding_rs = "0.8"
 gpui-kit = "=0.10.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+moye-plugin-api = { path = "plugins/sdk" }
 percent-encoding = "2"
 regex = "1"
 roxmltree = "0.21"

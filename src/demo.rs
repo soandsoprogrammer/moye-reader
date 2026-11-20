@@ -40,6 +40,7 @@ pub fn book() -> Book {
             header: None,
             notes: page.note_order,
             note_locations,
+            legacy_rows: page.legacy_rows,
         });
         for (fragment, block) in page.anchors {
             destinations.insert(

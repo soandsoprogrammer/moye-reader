@@ -1,8 +1,12 @@
-use std::{io::Cursor, path::Path, sync::Arc};
+use std::{
+    io::Cursor,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::Result;
 use gpui_kit::RenderImage;
-use image::{Frame, ImageReader, Limits};
+use image::{Frame, ImageReader, Limits, Rgba, RgbaImage};
 use smallvec::smallvec;
 
 use crate::epub::{MAX_IMAGE, open_zip, read_entry};
@@ -11,6 +15,58 @@ pub struct Picture {
     pub art: Arc<RenderImage>,
     pub width: u32,
     pub height: u32,
+    glyph: OnceLock<Arc<RenderImage>>,
+}
+
+impl Picture {
+    pub fn glyph(&self) -> Arc<RenderImage> {
+        self.glyph
+            .get_or_init(|| {
+                let src = self.art.as_bytes(0).unwrap();
+                let factor = (160. / self.width.max(self.height) as f32).min(1.);
+                let width = (self.width as f32 * factor).round().max(1.) as u32;
+                let height = (self.height as f32 * factor).round().max(1.) as u32;
+                let source = |x, y| {
+                    let index = 4 * (y as usize * self.width as usize + x as usize);
+                    &src[index..index + 4]
+                };
+                let corners = [
+                    source(0, 0),
+                    source(self.width - 1, 0),
+                    source(0, self.height - 1),
+                    source(self.width - 1, self.height - 1),
+                ];
+                let transparent = corners.iter().any(|pixel| pixel[3] < 16);
+                let dark_paper = corners
+                    .iter()
+                    .filter(|pixel| luminance(pixel) < 128)
+                    .count()
+                    >= 3;
+                let frame = |r, g, b| {
+                    Frame::new(RgbaImage::from_fn(width, height, |x, y| {
+                        let pixel = source(x * self.width / width, y * self.height / height);
+                        let coverage = if transparent {
+                            255
+                        } else if dark_paper {
+                            luminance(pixel)
+                        } else {
+                            255 - luminance(pixel)
+                        };
+                        let alpha = (u16::from(pixel[3]) * coverage / 255) as u8;
+                        Rgba([b, g, r, alpha])
+                    }))
+                };
+                Arc::new(RenderImage::new(smallvec![
+                    frame(39, 47, 42),
+                    frame(212, 223, 214)
+                ]))
+            })
+            .clone()
+    }
+}
+
+fn luminance(bgra: &[u8]) -> u16 {
+    (54 * u16::from(bgra[2]) + 183 * u16::from(bgra[1]) + 19 * u16::from(bgra[0])) >> 8
 }
 
 pub fn read_picture(archive: &Path, name: &str) -> Result<Picture> {
@@ -40,5 +96,10 @@ fn decode_picture(bytes: &[u8], max_side: u32) -> Result<Picture> {
     }
     let (width, height) = image.dimensions();
     let art = Arc::new(RenderImage::new(smallvec![Frame::new(image)]));
-    Ok(Picture { art, width, height })
+    Ok(Picture {
+        art,
+        width,
+        height,
+        glyph: OnceLock::new(),
+    })
 }

@@ -151,6 +151,12 @@ pub const SERIF: &str = if cfg!(target_os = "macos") {
     "Noto Serif CJK SC"
 };
 
+pub const READING_FONT: &str = if cfg!(target_os = "macos") {
+    "PingFang SC"
+} else {
+    SERIF
+};
+
 pub fn icon(path: &'static str, size: f32, color: u32) -> Icon {
     Icon::default()
         .path(path)
@@ -166,9 +172,7 @@ pub const RIGHT: &str = "icons/chevron-right.svg";
 pub const PEN: &str = "icons/pencil.svg";
 pub const CLOSE: &str = "icons/close.svg";
 pub const NOTE: &str = "icons/notebook-pen.svg";
-pub const LIST: &str = "icons/list.svg";
 pub const LIBRARY: &str = "icons/library.svg";
-pub const PANEL_RIGHT: &str = "icons/panel-right.svg";
 pub const PANEL_LEFT: &str = "icons/panel-left.svg";
 pub const ADD: &str = "icons/plus.svg";
 pub const TYPE: &str = "icons/a-large-small.svg";
@@ -187,15 +191,6 @@ pub fn label(text: impl Into<SharedString>, size: f32, color: u32) -> Div {
 
 pub fn line(color: u32) -> Div {
     div().w_full().h(px(1.)).flex_shrink_0().bg(rgb(color))
-}
-
-pub fn badge(text: impl Into<SharedString>, p: Palette) -> Div {
-    label(text, 10., p.green)
-        .font_weight(FontWeight::SEMIBOLD)
-        .px(px(6.))
-        .py(px(2.))
-        .rounded(px(4.))
-        .bg(rgb(p.green_bg))
 }
 
 pub fn surface(p: Palette) -> Div {

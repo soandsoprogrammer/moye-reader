@@ -1,0 +1,7 @@
+{
+  "protocol": 1,
+  "id": "folder-source",
+  "name": "文件夹书源",
+  "executable": "moye-folder-source",
+  "capabilities": ["source.list", "source.fetch", "settings.directory.get", "settings.directory.set"]
+}

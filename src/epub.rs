@@ -2,6 +2,8 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Seek},
+    num::NonZeroUsize,
+    ops::Range,
     path::Path,
     sync::LazyLock,
 };
@@ -12,8 +14,8 @@ use scraper::{ElementRef, Html, Selector, node::Node};
 use zip::ZipArchive;
 
 use crate::book::{
-    Block, BlockKind, Book, BookInfo, ContentsEntry, Inline, Link, NoteKind, Section, SourceNote,
-    Span, Target, decode_text, split_block,
+    Block, BlockKind, Book, BookInfo, ContentsEntry, Inline, LegacyRow, Link, NoteKind,
+    PointInText, Section, SourceNote, Span, Target, decode_text, split_block,
 };
 
 use crate::epub_style::{ColorSheet, read_colors, text_color};
@@ -299,7 +301,7 @@ pub fn parse_epub(mut info: BookInfo, path: &Path) -> Result<Book> {
             .map(|title| (*title).to_owned())
             .or_else(|| heading.map(|block| block.text.to_string()))
             .or(parsed.title.take())
-            .unwrap_or_else(|| format!("第 {} 节", section + 1));
+            .unwrap_or_default();
         let header = heading
             .filter(|block| {
                 block.text.trim() == title.trim()
@@ -353,6 +355,7 @@ pub fn parse_epub(mut info: BookInfo, path: &Path) -> Result<Book> {
             header,
             notes: parsed.note_order,
             note_locations: HashMap::new(),
+            legacy_rows: parsed.legacy_rows,
         });
         references.push(links);
         if is_linear && has_body {
@@ -439,7 +442,6 @@ pub fn parse_epub(mut info: BookInfo, path: &Path) -> Result<Book> {
     book.notes = notes;
     book.destinations = destinations;
     book.set_linear(linear);
-    let mut described = HashSet::new();
     for entry in navigation {
         if let Some(&(section, block)) = book.destinations.get(&entry.target).or_else(|| {
             book.destinations.get(&Target {
@@ -456,25 +458,29 @@ pub fn parse_epub(mut info: BookInfo, path: &Path) -> Result<Book> {
                 block,
                 depth: entry.depth,
             });
-            described.insert(section);
         }
     }
-    for &section in &book.linear {
-        if !described.contains(&section) {
-            let index = book
-                .contents
-                .iter()
-                .position(|entry| entry.section > section)
-                .unwrap_or(book.contents.len());
-            book.contents.insert(
-                index,
-                ContentsEntry {
-                    title: book.sections[section].title.clone(),
+    if book.contents.is_empty() {
+        let mut last_title = None;
+        for &section in &book.linear {
+            let title = &book.sections[section].title;
+            if !title.is_empty() && last_title != Some(title) {
+                book.contents.push(ContentsEntry {
+                    title: title.clone(),
                     section,
                     block: 0,
                     depth: 0,
-                },
-            );
+                });
+                last_title = Some(title);
+            }
+        }
+        if book.contents.is_empty() {
+            book.contents.push(ContentsEntry {
+                title: "正文".into(),
+                section: book.linear[0],
+                block: 0,
+                depth: 0,
+            });
         }
     }
     Ok(book)
@@ -722,6 +728,29 @@ fn image_note_marker(node: ElementRef<'_>, inline: &Inline) -> bool {
             }))
 }
 
+fn inline_glyph(node: ElementRef<'_>) -> bool {
+    node.value().attr("alt").is_some_and(|alt| {
+        matches!(
+            alt.trim().to_ascii_lowercase().as_str(),
+            "造字" | "外字" | "gaiji"
+        )
+    }) || node.value().classes().any(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "gaiji" | "gaiji-image" | "inline-glyph"
+        )
+    })
+}
+
+fn local_image(path: &str, node: ElementRef<'_>) -> Option<Target> {
+    node.value()
+        .attr("src")
+        .or_else(|| node.value().attr("href"))
+        .or_else(|| node.value().attr("xlink:href"))
+        .and_then(|src| local_target(path, src))
+        .filter(|target| target.path != path)
+}
+
 fn hidden(node: ElementRef<'_>) -> bool {
     matches!(
         node.value().name(),
@@ -845,6 +874,117 @@ pub(crate) struct Parsed {
     pub note_order: Vec<Target>,
     pub anchors: HashMap<String, usize>,
     pub title: Option<String>,
+    pub legacy_rows: Vec<LegacyRow>,
+}
+
+impl Parsed {
+    fn join_glyph_runs(&mut self, runs: Vec<Range<usize>>) {
+        let mut old = std::mem::take(&mut self.blocks).into_iter();
+        let mut index = 0;
+        for run in runs {
+            for block in old.by_ref().take(run.start - index) {
+                self.push_legacy_row(block);
+            }
+            let mut paragraph = old.by_ref().take(run.len());
+            let mut text = String::new();
+            let mut spans = Vec::new();
+            let mut locations = Vec::new();
+            let mut kind = BlockKind::Paragraph;
+            let mut quote_group = None;
+            for block in &mut paragraph {
+                let offset = text.len();
+                kind = block.kind;
+                quote_group = block.quote_group;
+                let glyph = block.spans.iter().find(|span| span.style.glyph.is_some());
+                locations.push(glyph.map_or((offset, block.text.len()), |span| {
+                    (offset + span.range.start, 0)
+                }));
+                text.push_str(&block.text);
+                spans.extend(block.spans.into_iter().map(|mut span| {
+                    span.range.start += offset;
+                    span.range.end += offset;
+                    span
+                }));
+            }
+            let mut block = self.blocks.len();
+            let mut offset = 0;
+            append_text_blocks(&mut self.blocks, &text, &kind, &spans, quote_group);
+            for (start, len) in locations {
+                while block + 1 < self.blocks.len()
+                    && start >= offset + self.blocks[block].text.len()
+                {
+                    offset += self.blocks[block].text.len();
+                    block += 1;
+                }
+                self.legacy_rows.push(LegacyRow {
+                    start: PointInText {
+                        block,
+                        byte: start - offset,
+                    },
+                    len,
+                });
+            }
+            index = run.end;
+        }
+        for block in old {
+            self.push_legacy_row(block);
+        }
+        for block in self.anchors.values_mut() {
+            if let Some(row) = self
+                .legacy_rows
+                .get(*block)
+                .or_else(|| self.legacy_rows.last())
+            {
+                *block = row.start.block;
+            }
+        }
+    }
+
+    fn push_legacy_row(&mut self, block: Block) {
+        self.legacy_rows.push(LegacyRow {
+            start: PointInText {
+                block: self.blocks.len(),
+                byte: 0,
+            },
+            len: block.text.len(),
+        });
+        self.blocks.push(block);
+    }
+}
+
+fn append_text_blocks(
+    blocks: &mut Vec<Block>,
+    text: &str,
+    kind: &BlockKind,
+    spans: &[Span],
+    quote_group: Option<NonZeroUsize>,
+) {
+    let mut offset = 0;
+    let mut span_start = 0;
+    for chunk in split_block(text, 4096) {
+        let end = offset + chunk.len();
+        while spans
+            .get(span_start)
+            .is_some_and(|span| span.range.end <= offset)
+        {
+            span_start += 1;
+        }
+        let spans = spans[span_start..]
+            .iter()
+            .take_while(|span| span.range.start < end)
+            .map(|span| Span {
+                range: (span.range.start.max(offset) - offset)..(span.range.end.min(end) - offset),
+                style: span.style.clone(),
+            })
+            .collect();
+        blocks.push(Block {
+            text: chunk.to_owned().into(),
+            kind: kind.clone(),
+            spans,
+            quote_group,
+        });
+        offset = end;
+    }
 }
 
 pub(crate) fn parse_page(path: &str, source: &str) -> Parsed {
@@ -887,6 +1027,12 @@ fn parse_page_with_styles(
         pending_space: false,
         styles: &styles,
         attribute_note_count: 0,
+        inline_runs: Vec::new(),
+        run_start: 0,
+        run_has_glyph: false,
+        after_glyph: false,
+        quote_group: None,
+        quote_count: 0,
     };
     builder.result.title = html
         .select(&selector("title"))
@@ -908,7 +1054,10 @@ fn parse_page_with_styles(
         }
     }
     builder.walk(body, &Inline::default(), &BlockKind::Paragraph, 0, false);
-    builder.flush(&BlockKind::Paragraph);
+    builder.finish_run(&BlockKind::Paragraph);
+    if !builder.inline_runs.is_empty() {
+        builder.result.join_glyph_runs(builder.inline_runs);
+    }
     let last = builder.result.blocks.len().saturating_sub(1);
     for block in builder.result.anchors.values_mut() {
         *block = (*block).min(last);
@@ -924,6 +1073,12 @@ struct PageBuilder<'a> {
     pending_space: bool,
     styles: &'a [ColorSheet],
     attribute_note_count: usize,
+    inline_runs: Vec<Range<usize>>,
+    run_start: usize,
+    run_has_glyph: bool,
+    after_glyph: bool,
+    quote_group: Option<NonZeroUsize>,
+    quote_count: usize,
 }
 
 impl PageBuilder<'_> {
@@ -934,11 +1089,18 @@ impl PageBuilder<'_> {
         } else {
             for ch in text.chars() {
                 if matches!(ch, ' ' | '\n' | '\r' | '\t' | '\x0c') {
-                    self.pending_space = !self.text.is_empty() && !self.text.ends_with('\n');
+                    self.pending_space =
+                        self.after_glyph || (!self.text.is_empty() && !self.text.ends_with('\n'));
                 } else {
                     if std::mem::take(&mut self.pending_space) {
-                        self.text.push(' ');
+                        if self.after_glyph {
+                            let last = self.result.blocks.last_mut().unwrap();
+                            last.text = format!("{} ", last.text).into();
+                        } else {
+                            self.text.push(' ');
+                        }
                     }
+                    self.after_glyph = false;
                     self.text.push(ch);
                 }
             }
@@ -961,39 +1123,68 @@ impl PageBuilder<'_> {
     }
 
     fn flush(&mut self, kind: &BlockKind) {
-        let text = self.text.trim_end_matches('\n');
-        if !text.is_empty() {
-            let mut offset = 0;
-            let mut span_start = 0;
-            for chunk in split_block(text, 4096) {
-                let end = offset + chunk.len();
-                while self
-                    .spans
-                    .get(span_start)
-                    .is_some_and(|span| span.range.end <= offset)
-                {
-                    span_start += 1;
-                }
-                let spans = self.spans[span_start..]
-                    .iter()
-                    .take_while(|span| span.range.start < end)
-                    .map(|span| Span {
-                        range: (span.range.start.max(offset) - offset)
-                            ..(span.range.end.min(end) - offset),
-                        style: span.style.clone(),
-                    })
-                    .collect();
-                self.result.blocks.push(Block {
-                    text: chunk.to_owned().into(),
-                    kind: kind.clone(),
-                    spans,
-                });
-                offset = end;
-            }
-        }
+        append_text_blocks(
+            &mut self.result.blocks,
+            self.text.trim_end_matches('\n'),
+            kind,
+            &self.spans,
+            self.quote_group.filter(|_| *kind == BlockKind::Quote),
+        );
         self.text.clear();
         self.spans.clear();
         self.pending_space = false;
+        self.after_glyph = false;
+    }
+
+    fn finish_run(&mut self, kind: &BlockKind) {
+        self.flush(kind);
+        if std::mem::take(&mut self.run_has_glyph) {
+            self.inline_runs
+                .push(self.run_start..self.result.blocks.len());
+        }
+        self.run_start = self.result.blocks.len();
+    }
+
+    fn record_anchor(&mut self, node: ElementRef<'_>) {
+        if let Some(id) = anchor_id(node) {
+            self.result
+                .anchors
+                .entry(id.to_owned())
+                .or_insert(self.result.blocks.len());
+        }
+    }
+
+    fn append_glyph(
+        &mut self,
+        node: ElementRef<'_>,
+        target: Target,
+        inline: &Inline,
+        kind: &BlockKind,
+    ) {
+        let suffix = self.text.len() - self.text.trim_end_matches('\n').len();
+        let mut text = "\n".repeat(suffix);
+        if self.pending_space {
+            text.push(' ');
+        }
+        self.flush(kind);
+        self.record_anchor(node);
+        let start = text.len();
+        let alt = node.value().attr("alt").unwrap_or_default().trim();
+        let replacement = alt.chars().next().filter(|_| alt.chars().count() == 1);
+        text.push(replacement.unwrap_or('〓'));
+        let mut style = inline.clone();
+        style.glyph = Some(target.path);
+        self.result.blocks.push(Block {
+            spans: vec![Span {
+                range: start..text.len(),
+                style,
+            }],
+            text: text.into(),
+            kind: kind.clone(),
+            quote_group: self.quote_group.filter(|_| *kind == BlockKind::Quote),
+        });
+        self.run_has_glyph = true;
+        self.after_glyph = true;
     }
 
     fn walk(
@@ -1033,20 +1224,28 @@ impl PageBuilder<'_> {
             | "address" => Some(parent.clone()),
             _ => None,
         };
-        if matches!(tag, "img" | "image") && image_note_marker(node, inline) {
+        let image = matches!(tag, "img" | "image");
+        if image && image_note_marker(node, inline) {
             let mut marker = inline.clone();
             marker.note_ref = true;
             self.append("〔注〕", &marker, false);
             return;
         }
-        if block.is_some() || matches!(tag, "img" | "image" | "hr") {
-            self.flush(parent);
+        if image
+            && inline_glyph(node)
+            && let Some(target) = local_image(self.path, node)
+        {
+            self.append_glyph(node, target, inline, parent);
+            return;
         }
-        if let Some(id) = anchor_id(node) {
-            self.result
-                .anchors
-                .entry(id.to_owned())
-                .or_insert(self.result.blocks.len());
+        if block.is_some() || image || tag == "hr" {
+            self.finish_run(parent);
+        }
+        self.record_anchor(node);
+        let enclosing_quote = self.quote_group;
+        if tag == "blockquote" {
+            self.quote_count += 1;
+            self.quote_group = NonZeroUsize::new(self.quote_count);
         }
         let kind = block.as_ref().unwrap_or(parent);
         let mut inline = inline.clone();
@@ -1060,15 +1259,7 @@ impl PageBuilder<'_> {
         match tag {
             "img" | "image" => {
                 let alt = node.value().attr("alt").unwrap_or("").to_owned();
-                let src = node
-                    .value()
-                    .attr("src")
-                    .or_else(|| node.value().attr("href"))
-                    .or_else(|| node.value().attr("xlink:href"));
-                if let Some(target) = src
-                    .and_then(|src| local_target(self.path, src))
-                    .filter(|target| target.path != self.path)
-                {
+                if let Some(target) = local_image(self.path, node) {
                     self.result.blocks.push(Block {
                         kind: BlockKind::Image {
                             path: target.path,
@@ -1079,6 +1270,7 @@ impl PageBuilder<'_> {
                 } else if !alt.is_empty() {
                     self.result.blocks.push(Block::paragraph(alt));
                 }
+                self.run_start = self.result.blocks.len();
                 return;
             }
             "hr" => {
@@ -1086,10 +1278,12 @@ impl PageBuilder<'_> {
                     kind: BlockKind::Rule,
                     ..Default::default()
                 });
+                self.run_start = self.result.blocks.len();
                 return;
             }
             "br" => {
                 self.pending_space = false;
+                self.after_glyph = false;
                 self.text.push('\n');
                 return;
             }
@@ -1164,7 +1358,8 @@ impl PageBuilder<'_> {
             self.append("〔注〕", &inline, false);
         }
         if block.is_some() {
-            self.flush(kind);
+            self.finish_run(kind);
         }
+        self.quote_group = enclosing_quote;
     }
 }

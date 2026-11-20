@@ -1,4 +1,5 @@
 use gpui_kit::{
+    base::InteractiveElementExt as _,
     component::{input::Textarea, tooltip::Tooltip},
     prelude::FluentBuilder as _,
     *,
@@ -7,13 +8,49 @@ use gpui_kit::{
 use crate::{
     book::{Link, PointInText, Target},
     library::{Annotation, Bookmark, Paper, ReadingMode, Tone},
-    reader::{Reader, ReadingPanel, Screen, Tab},
+    plugin_view::PLUGIN_ICON,
+    reader::{NotePopup, Reader, ReadingPanel, Screen, Tab},
     style::{self, *},
 };
 
 type Control = Stateful<Div>;
-const TOP_HEIGHT: Pixels = px(57.);
-const FOOTER_HEIGHT: Pixels = px(56.);
+const SHELF_BAR_HEIGHT: Pixels = px(57.);
+const READING_HEADER_HEIGHT: Pixels = px(44.);
+const READING_FOOTER_HEIGHT: Pixels = px(40.);
+const WINDOW_CONTROLS_INSET: Pixels = if cfg!(target_os = "macos") {
+    px(81.)
+} else {
+    px(12.)
+};
+
+pub(crate) fn traffic_light_position(screen: Screen) -> Point<Pixels> {
+    let height = match screen {
+        Screen::Library | Screen::Plugins => SHELF_BAR_HEIGHT,
+        Screen::Reading => READING_HEADER_HEIGHT,
+    };
+    // AppKit takes the origin of the 14-point buttons.
+    point(px(17.), height / 2. - px(7.))
+}
+
+fn titlebar_area(id: &'static str, cx: &Context<Reader>) -> Control {
+    div()
+        .id(id)
+        .window_control_area(WindowControlArea::Drag)
+        // Windows already handles caption dragging and double-clicks for this area.
+        .when(!cfg!(target_os = "windows"), |area| {
+            area.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|reader, event: &MouseDownEvent, window, _| {
+                    reader.titlebar_press = (!window.is_fullscreen()).then_some(event.position);
+                }),
+            )
+            .on_double_click(|_, window, _| {
+                if !window.is_fullscreen() {
+                    window.zoom_window();
+                }
+            })
+        })
+}
 
 fn control(id: impl Into<ElementId>, p: Palette) -> Control {
     button_style(id, p.soft, p.hover)
@@ -126,25 +163,30 @@ impl Render for Reader {
             Palette::for_library()
         };
         let viewport = window.viewport_size();
-        let slim = viewport.width < px(1110.);
-        let left = if slim { px(172.) } else { px(202.) };
-        let right = if slim { px(241.) } else { px(285.) };
+        let rail = if self.rail_visible() {
+            if viewport.width < px(1110.) {
+                px(208.)
+            } else {
+                px(228.)
+            }
+        } else {
+            px(0.)
+        };
         let main = if reading {
-            let mut width = viewport.width;
-            if !self.handheld && self.panel_open(ReadingPanel::Contents) {
-                width -= left;
-            }
-            if !self.handheld && self.panel_open(ReadingPanel::Notes) {
-                width -= right;
-            }
+            let width = viewport.width - rail;
             self.sync_pagination(
-                size(width, viewport.height - TOP_HEIGHT - FOOTER_HEIGHT),
+                size(
+                    width,
+                    viewport.height - READING_HEADER_HEIGHT - READING_FOOTER_HEIGHT,
+                ),
                 p,
                 window,
                 cx,
             );
-            self.reading_layout(left, right, p, window, cx)
+            self.reading_layout(rail, width, p, window, cx)
                 .into_any_element()
+        } else if self.screen == Screen::Plugins {
+            self.plugins_page(p, cx)
         } else {
             self.shelf_page(window, p, cx).into_any_element()
         };
@@ -165,21 +207,47 @@ impl Render for Reader {
             .flex()
             .flex_col()
             .on_key_down(cx.listener(Self::key_down))
+            .when(!cfg!(target_os = "windows"), |root| {
+                root.on_mouse_move(cx.listener(|reader, event: &MouseMoveEvent, window, _| {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        reader.titlebar_press = None;
+                    } else if let Some(origin) = reader.titlebar_press
+                        && ((event.position.x - origin.x).abs() >= px(4.)
+                            || (event.position.y - origin.y).abs() >= px(4.))
+                    {
+                        reader.titlebar_press = None;
+                        window.start_window_move();
+                    }
+                }))
+            })
             .capture_any_mouse_up(cx.listener(|reader, event: &MouseUpEvent, window, cx| {
                 if event.button == MouseButton::Left {
+                    reader.titlebar_press = None;
+                    reader.finish_shelf_press();
                     reader.end_drag(event, window, cx);
                 }
             }))
-            .on_drop(cx.listener(|reader, paths: &ExternalPaths, window, cx| {
-                reader.import_paths(paths.0.to_vec(), window, cx);
+            .on_mouse_move(cx.listener(|reader, event: &MouseMoveEvent, _, _| {
+                reader.shelf_press_moved(event);
             }))
-            .child(self.top_bar(p, cx))
+            .on_drop(cx.listener(|reader, paths: &ExternalPaths, window, cx| {
+                if reader.shelf_dialog.is_none() {
+                    reader.import_paths(paths.0.to_vec(), window, cx);
+                }
+            }))
+            .when(!reading, |root| root.child(self.shelf_bar(p, cx)))
             .child(main)
-            .when_some(self.handheld_panel.filter(|_| reading), |root, panel| {
-                root.child(self.handheld_drawer(panel, p, cx))
+            .when_some(self.shelf_dialog.as_ref(), |root, dialog| {
+                root.child(self.shelf_dialog_view(dialog, window, p, cx))
             })
-            .when(reading && self.source_popup.is_some(), |root| {
-                root.child(self.source_popup_view(window, p, cx))
+            .when_some(self.sources.as_ref().filter(|_| !reading), |root, panel| {
+                root.child(self.sources_view(panel, window, p, cx))
+            })
+            .when_some(self.reading_drawer.filter(|_| reading), |root, panel| {
+                root.child(self.reading_drawer_view(panel, rail, p, cx))
+            })
+            .when(reading && self.note_popup.is_some(), |root| {
+                root.child(self.note_popup_view(window, p, cx))
             })
             .when(reading && self.settings_open, |root| {
                 root.child(self.reading_settings(p, cx))
@@ -201,10 +269,14 @@ impl Render for Reader {
 }
 
 impl Reader {
+    pub(crate) fn rail_visible(&self) -> bool {
+        !self.handheld && self.panel_open(ReadingPanel::Contents)
+    }
+
     fn reading_layout(
         &self,
-        left: Pixels,
-        right: Pixels,
+        rail: Pixels,
+        width: Pixels,
         p: Palette,
         window: &Window,
         cx: &mut Context<Self>,
@@ -214,10 +286,9 @@ impl Reader {
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .when(
-                !self.handheld && self.panel_open(ReadingPanel::Contents),
-                |row| row.child(self.contents_panel(left, p, cx)),
-            )
+            .when(rail > px(0.), |row| {
+                row.child(self.reading_rail(rail, p, window, cx))
+            })
             .child(
                 div()
                     .flex()
@@ -225,17 +296,52 @@ impl Reader {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
+                    .child(self.chapter_header(rail > px(0.), width, p, cx))
                     .child(self.page(p, window, cx))
                     .child(self.footer(p, cx)),
             )
-            .when(
-                !self.handheld && self.panel_open(ReadingPanel::Notes),
-                |row| row.child(self.notes_panel(right, p, cx)),
+    }
+
+    fn chapter_header(&self, pinned: bool, width: Pixels, p: Palette, cx: &Context<Self>) -> Div {
+        div()
+            .h(READING_HEADER_HEIGHT)
+            .w_full()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .when(!pinned, |header| {
+                header.child(self.reading_tools(false, p, cx))
+            })
+            .child(
+                titlebar_area("reading-titlebar", cx)
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .pl(if pinned {
+                        self.reading_text_inset(width)
+                    } else {
+                        px(16.)
+                    })
+                    .pr(px(18.))
+                    .child(
+                        label(self.chapter_title(), 12., p.dim)
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_ellipsis(),
+                    ),
             )
     }
 
-    fn handheld_drawer(&self, panel: ReadingPanel, p: Palette, cx: &mut Context<Self>) -> Div {
-        let width = px(288.);
+    fn reading_drawer_view(
+        &self,
+        panel: ReadingPanel,
+        rail: Pixels,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let width = if self.handheld { px(288.) } else { px(318.) };
         let drawer = div()
             .absolute()
             .top_0()
@@ -247,37 +353,64 @@ impl Reader {
             .track_focus(&self.handheld_controls)
             .occlude();
         let drawer = match panel {
-            ReadingPanel::Contents => drawer.left_0().child(self.contents_panel(width, p, cx)),
+            ReadingPanel::Contents => drawer.left_0().child(
+                div()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .bg(rgb(p.rail))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .px(px(14.))
+                            .h(px(44.))
+                            .child(label("目录", 14., p.ink).font_weight(FontWeight::SEMIBOLD))
+                            .child(
+                                icon_control("close-contents", CLOSE, "关闭目录", false, p)
+                                    .on_click(cx.listener(|reader, _, window, cx| {
+                                        reader.set_panel(ReadingPanel::Contents, false, cx);
+                                        reader.focus.focus(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(self.contents_list(p, cx)),
+            ),
             ReadingPanel::Notes => drawer.right_0().child(self.notes_panel(width, p, cx)),
         };
         div()
             .absolute()
-            .top(TOP_HEIGHT)
-            .bottom(FOOTER_HEIGHT)
-            .w_full()
+            .top(READING_HEADER_HEIGHT)
+            .bottom(READING_FOOTER_HEIGHT)
+            .left(rail)
+            .right_0()
             .child(
                 div()
                     .id("dismiss-handheld-drawer")
                     .absolute()
                     .inset_0()
-                    .bg(rgba(0x121b1554))
+                    .bg(rgba(if self.handheld {
+                        0x121b1536
+                    } else {
+                        0x121b1515
+                    }))
                     .occlude()
-                    .on_click(
-                        cx.listener(move |reader, _, _, cx| reader.set_panel(panel, false, cx)),
-                    ),
+                    .on_click(cx.listener(move |reader, _, window, cx| {
+                        reader.set_panel(panel, false, cx);
+                        reader.focus.focus(window, cx);
+                    })),
             )
             .child(drawer)
     }
 
-    fn top_bar(&self, p: Palette, cx: &Context<Self>) -> Div {
-        let reading = self.screen == Screen::Reading;
-        let title = div()
+    fn shelf_bar(&self, p: Palette, cx: &Context<Self>) -> Div {
+        let title = titlebar_area("shelf-title", cx)
             .h_full()
             .flex_shrink_0()
             .flex()
             .items_center()
             .gap(px(8.))
-            .window_control_area(WindowControlArea::Drag)
             .child(
                 div()
                     .flex()
@@ -302,30 +435,10 @@ impl Reader {
             })
             .on_click(cx.listener(|reader, _, window, cx| reader.choose_files(window, cx)));
 
-        let middle = div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(8.))
-            .window_control_area(WindowControlArea::Drag)
-            .when(reading, |el| {
-                el.child(
-                    label(self.book.info.title.clone(), 13., p.ink)
-                        .min_w_0()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .font_weight(FontWeight::SEMIBOLD),
-                )
-                .child(badge(self.book.info.format.label(), p).flex_shrink_0())
-            });
-
         div()
             .flex()
             .items_center()
-            .h(TOP_HEIGHT)
+            .h(SHELF_BAR_HEIGHT)
             .flex_shrink_0()
             .pl(if cfg!(target_os = "macos") {
                 px(96.)
@@ -345,60 +458,87 @@ impl Reader {
                     .items_center()
                     .gap(px(4.))
                     .child(
-                        nav_item("open-library", "书库", LIBRARY, !reading, p)
-                            .on_click(
-                                cx.listener(|reader, _, window, cx| {
-                                    reader.open_library(window, cx)
-                                }),
-                            )
-                            .when(self.handheld, |el| el.h(px(44.))),
+                        nav_item(
+                            "open-library",
+                            "书库",
+                            LIBRARY,
+                            self.screen == Screen::Library,
+                            p,
+                        )
+                        .on_click(
+                            cx.listener(|reader, _, window, cx| reader.open_library(window, cx)),
+                        )
+                        .when(self.handheld, |el| el.h(px(44.))),
                     )
                     .child(
-                        nav_item("open-reader", "阅读", BOOK, reading, p)
+                        nav_item("open-reader", "阅读", BOOK, false, p)
                             .on_click(
                                 cx.listener(|reader, _, window, cx| reader.open_reader(window, cx)),
                             )
                             .when(self.handheld, |el| el.h(px(44.))),
+                    )
+                    .child(
+                        nav_item(
+                            "open-plugins",
+                            "插件",
+                            PLUGIN_ICON,
+                            self.screen == Screen::Plugins,
+                            p,
+                        )
+                        .on_click(
+                            cx.listener(|reader, _, window, cx| reader.open_plugins(window, cx)),
+                        )
+                        .when(self.handheld, |el| el.h(px(44.))),
                     ),
             )
-            .child(middle)
-            .when(!reading, |bar| bar.child(import))
-            .when(reading, |bar| bar.child(self.reading_actions(p, cx)))
+            .child(titlebar_area("shelf-title-space", cx).flex_1().h_full())
+            .when(self.screen == Screen::Library, |bar| {
+                bar.child(
+                    control("book-sources", p)
+                        .when(self.handheld, |el| el.h(px(44.)))
+                        .child("书籍来源")
+                        .on_click(
+                            cx.listener(|reader, _, window, cx| reader.open_sources(window, cx)),
+                        ),
+                )
+                .child(import)
+            })
     }
 
-    fn reading_actions(&self, p: Palette, cx: &Context<Self>) -> Div {
-        let settings = control("reading-settings", p)
-            .aria_label("阅读设置")
-            .when(self.handheld, |el| el.h(px(44.)))
-            .when(self.settings_open, |el| el.bg(rgb(p.green_bg)))
-            .child(icon(TYPE, 17., p.green))
-            .child("阅读设置")
-            .on_click(cx.listener(|reader, _, _, cx| {
-                reader.anchor = None;
-                reader.source_popup = None;
-                reader.handheld_panel = None;
-                reader.settings_open = !reader.settings_open;
-                cx.notify();
-            }));
-        let marked = self.bookmarks().contains(&self.bookmark_position());
-        let bookmark = icon_control(
-            "bookmark-current",
-            if marked { BOOKMARKED } else { BOOKMARK },
-            if marked {
-                "移除此处书签"
-            } else {
-                "添加书签"
-            },
-            marked,
-            p,
-        )
-        .when(self.handheld, |el| el.size(px(44.)))
-        .on_click(cx.listener(|reader, _, window, cx| reader.toggle_bookmark(window, cx)));
+    fn reading_tools(&self, pinned: bool, p: Palette, cx: &Context<Self>) -> Div {
+        let target = if self.handheld { px(41.) } else { px(30.) };
         div()
+            .h(READING_HEADER_HEIGHT)
+            .pl(WINDOW_CONTROLS_INSET)
+            .pr(px(9.))
+            .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(5.))
-            .flex_shrink_0()
+            .gap(px(3.))
+            .child(
+                icon_control("reader-library", LIBRARY, "返回书库", false, p)
+                    .size(target)
+                    .on_click(cx.listener(|reader, _, window, cx| reader.open_library(window, cx))),
+            )
+            .child(
+                icon_control(
+                    "reader-contents",
+                    PANEL_LEFT,
+                    "显示或隐藏目录",
+                    self.panel_open(ReadingPanel::Contents),
+                    p,
+                )
+                .size(target)
+                .on_click(cx.listener(|reader, _, _, cx| {
+                    let panel = ReadingPanel::Contents;
+                    reader.set_panel(panel, !reader.panel_open(panel), cx);
+                })),
+            )
+            .child(
+                icon_control("reading-settings", TYPE, "阅读设置", self.settings_open, p)
+                    .size(target)
+                    .on_click(cx.listener(|reader, _, _, cx| reader.toggle_reading_settings(cx))),
+            )
             .when(self.can_go_back(), |bar| {
                 bar.child(
                     icon_control(
@@ -408,46 +548,158 @@ impl Reader {
                         false,
                         p,
                     )
+                    .size(target)
                     .on_click(cx.listener(|reader, _, _, cx| reader.go_back(cx))),
                 )
             })
-            .child(
-                icon_control(
-                    "toggle-sidebar",
-                    PANEL_LEFT,
-                    "显示或隐藏目录",
-                    self.panel_open(ReadingPanel::Contents),
-                    p,
+            .when(pinned, |bar| {
+                bar.child(
+                    titlebar_area("reading-titlebar-space", cx)
+                        .flex_1()
+                        .h_full(),
                 )
-                .when(self.handheld, |el| el.size(px(44.)))
-                .on_click(cx.listener(|reader, _, _, cx| {
-                    let panel = ReadingPanel::Contents;
-                    reader.set_panel(panel, !reader.panel_open(panel), cx);
-                })),
+            })
+            .when(!pinned, |bar| {
+                bar.child(
+                    icon_control(
+                        "reader-notes",
+                        NOTE,
+                        "阅读记录",
+                        self.panel_open(ReadingPanel::Notes),
+                        p,
+                    )
+                    .size(target)
+                    .on_click(cx.listener(|reader, _, _, cx| {
+                        let panel = ReadingPanel::Notes;
+                        reader.set_panel(panel, !reader.panel_open(panel), cx);
+                    })),
+                )
+                .child(self.bookmark_button(p, cx).size(target))
+            })
+    }
+
+    fn toggle_reading_settings(&mut self, cx: &mut Context<Self>) {
+        self.anchor = None;
+        self.note_popup = None;
+        self.reading_drawer = None;
+        self.settings_open = !self.settings_open;
+        cx.notify();
+    }
+
+    fn bookmark_button(&self, p: Palette, cx: &Context<Self>) -> Control {
+        let marked = self.bookmarks().contains(&self.bookmark_position());
+        icon_control(
+            "bookmark-current",
+            if marked { BOOKMARKED } else { BOOKMARK },
+            if marked {
+                "移除此处书签"
+            } else {
+                "添加当前位置书签"
+            },
+            marked,
+            p,
+        )
+        .on_click(cx.listener(|reader, _, window, cx| reader.toggle_bookmark(window, cx)))
+    }
+
+    fn reading_rail(&self, width: Pixels, p: Palette, window: &Window, cx: &Context<Self>) -> Div {
+        let info = &self.book.info;
+        let records_open = self.panel_open(ReadingPanel::Notes);
+        div()
+            .h_full()
+            .w(width)
+            .min_h_0()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.rail))
+            .border_r_1()
+            .border_color(rgb(p.line))
+            .child(self.reading_tools(true, p, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(11.))
+                    .px(px(15.))
+                    .pt(px(9.))
+                    .pb(px(15.))
+                    .child(
+                        self.book_cover(info, p, window, &cx.weak_entity())
+                            .w(px(36.))
+                            .h(px(53.)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                label(info.title.clone(), 14., p.ink)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .line_clamp(2),
+                            )
+                            .when(!info.author.is_empty(), |meta| {
+                                meta.child(
+                                    label(info.author.clone(), 11., p.dim)
+                                        .mt(px(4.))
+                                        .line_clamp(1),
+                                )
+                            }),
+                    ),
             )
-            .child(settings)
-            .child(bookmark)
+            .child(line(p.line))
+            .child(self.contents_list(p, cx))
             .child(
-                icon_control(
-                    "toggle-notes",
-                    PANEL_RIGHT,
-                    "显示或隐藏批注",
-                    self.panel_open(ReadingPanel::Notes),
-                    p,
-                )
-                .when(self.handheld, |el| el.size(px(44.)))
-                .on_click(cx.listener(|reader, _, _, cx| {
-                    let panel = ReadingPanel::Notes;
-                    reader.set_panel(panel, !reader.panel_open(panel), cx);
-                })),
+                div()
+                    .h(READING_FOOTER_HEIGHT)
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.))
+                    .px(px(10.))
+                    .border_t_1()
+                    .border_color(rgb(p.line))
+                    .child(
+                        control("reader-notes", p)
+                            .when(records_open && self.tab != Tab::Bookmarks, |el| {
+                                el.bg(rgb(p.green_bg))
+                            })
+                            .child(icon(NOTE, 15., p.green))
+                            .child("批注")
+                            .on_click(cx.listener(|reader, _, _, cx| {
+                                let open = !reader.panel_open(ReadingPanel::Notes)
+                                    || reader.tab == Tab::Bookmarks;
+                                if reader.tab == Tab::Bookmarks {
+                                    reader.tab = Tab::Source;
+                                }
+                                reader.set_panel(ReadingPanel::Notes, open, cx);
+                            })),
+                    )
+                    .child(
+                        control("reader-bookmarks", p)
+                            .when(records_open && self.tab == Tab::Bookmarks, |el| {
+                                el.bg(rgb(p.green_bg))
+                            })
+                            .child("书签")
+                            .on_click(cx.listener(|reader, _, _, cx| {
+                                let open = !reader.panel_open(ReadingPanel::Notes)
+                                    || reader.tab != Tab::Bookmarks;
+                                reader.tab = Tab::Bookmarks;
+                                reader.set_panel(ReadingPanel::Notes, open, cx);
+                            })),
+                    )
+                    .child(self.bookmark_button(p, cx)),
             )
     }
 
-    fn contents_panel(&self, width: Pixels, p: Palette, cx: &Context<Self>) -> Div {
+    fn contents_list(&self, p: Palette, cx: &Context<Self>) -> Div {
         let visible_item = self.visible_item().saturating_sub(1);
         let active = self.contents_entry(self.section, visible_item);
         let view = cx.weak_entity();
         let book = self.book.clone();
+        let row_height = if self.handheld { px(38.) } else { px(32.) };
         let rows = uniform_list(
             "contents-scroll",
             book.contents.len(),
@@ -459,7 +711,7 @@ impl Reader {
                         let section = entry.section;
                         let block = entry.block;
                         let view = view.clone();
-                        div().w_full().h(px(37.)).pb(px(3.)).child(
+                        div().w_full().h(row_height).pb(px(2.)).child(
                             div()
                                 .id(("chapter", index))
                                 .h_full()
@@ -474,6 +726,7 @@ impl Reader {
                                 .tab_stop(true)
                                 .when(selected, |el| el.bg(rgb(p.green_bg)))
                                 .when(!selected, |el| el.hover(|s| s.bg(rgb(p.hover))))
+                                .focus_visible(|el| el.bg(rgb(p.hover)))
                                 .child(
                                     div()
                                         .w(px(2.))
@@ -509,33 +762,12 @@ impl Reader {
         .w_full();
 
         div()
-            .w(width)
-            .h_full()
-            .flex_shrink_0()
+            .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .bg(rgb(p.rail))
-            .border_r_1()
-            .border_color(rgb(p.line))
-            .px(px(13.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(56.))
-                    .px(px(6.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.))
-                            .child(icon(LIST, 15., p.green))
-                            .child(label("目录", 14., p.ink).font_weight(FontWeight::SEMIBOLD)),
-                    )
-                    .child(label(self.book.contents.len().to_string(), 11., p.dim)),
-            )
+            .px(px(8.))
+            .pt(px(6.))
             .child(rows)
     }
 
@@ -552,7 +784,7 @@ impl Reader {
         };
         let previous = control("previous", p)
             .px(px(8.))
-            .when(self.handheld, |el| el.h(px(44.)).px(px(12.)))
+            .when(self.handheld, |el| el.h(READING_FOOTER_HEIGHT).px(px(12.)))
             .aria_label(previous_title)
             .child(icon(LEFT, 15., p.soft))
             .child(previous_title)
@@ -560,22 +792,21 @@ impl Reader {
             .on_click(cx.listener(|reader, _, _, cx| reader.turn(false, cx)));
         let next = control("next", p)
             .px(px(8.))
-            .when(self.handheld, |el| el.h(px(44.)).px(px(12.)))
+            .when(self.handheld, |el| el.h(READING_FOOTER_HEIGHT).px(px(12.)))
             .aria_label(next_title)
             .child(next_title)
             .child(icon(RIGHT, 15., p.soft))
             .when(!after, |b| b.opacity(0.4).cursor_default().tab_stop(false))
             .on_click(cx.listener(|reader, _, _, cx| reader.turn(true, cx)));
         div()
-            .h(FOOTER_HEIGHT)
+            .h(READING_FOOTER_HEIGHT)
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(14.))
-            .px(px(17.))
+            .gap(px(12.))
+            .px(px(20.))
             .border_t_1()
             .border_color(rgb(p.line))
-            .bg(rgb(p.panel))
             .child(previous)
             .child(
                 div()
@@ -594,7 +825,11 @@ impl Reader {
                                 } else {
                                     start.to_string()
                                 };
-                                format!("本章 {current} / {}", self.page_count())
+                                if self.page_count_is_chapter() {
+                                    format!("本章 {current} / {}", self.page_count())
+                                } else {
+                                    format!("{current} / {} 页", self.page_count())
+                                }
                             } else {
                                 "阅读进度".to_owned()
                             },
@@ -606,7 +841,7 @@ impl Reader {
                     .child(
                         div()
                             .flex_1()
-                            .h(px(4.))
+                            .h(px(2.))
                             .rounded_full()
                             .overflow_hidden()
                             .bg(rgb(p.line))
@@ -619,7 +854,7 @@ impl Reader {
                             ),
                     )
                     .child(
-                        label(percent, 11., p.green)
+                        label(percent, 11., p.dim)
                             .w(px(34.))
                             .text_right()
                             .font_weight(FontWeight::SEMIBOLD),
@@ -889,7 +1124,10 @@ impl Reader {
     ) -> Div {
         let section = self.book.sections.get(bookmark.section);
         let title = section
-            .map(|section| section.title.clone())
+            .map(|_| {
+                self.book
+                    .title_at(bookmark.section, bookmark.item.saturating_sub(1))
+            })
             .unwrap_or_else(|| "原章节已不可用".into());
         let excerpt = section
             .and_then(|section| {
@@ -969,20 +1207,40 @@ impl Reader {
             )
     }
 
-    fn source_popup_view(&self, window: &Window, p: Palette, cx: &Context<Self>) -> Div {
-        let Some((target, anchor)) = &self.source_popup else {
+    fn note_popup_view(&self, window: &Window, p: Palette, cx: &Context<Self>) -> Div {
+        let Some((popup, anchor)) = &self.note_popup else {
             return div();
         };
-        let Some(note) = self.book.notes.get(target) else {
+        let content = match popup {
+            NotePopup::Source(target) => self.book.notes.get(target).map(|note| {
+                (
+                    note.title.clone(),
+                    note.text.clone(),
+                    p.note_color(note.kind),
+                )
+            }),
+            NotePopup::Personal(id) => {
+                self.annotations()
+                    .iter()
+                    .find(|note| note.id == *id)
+                    .map(|note| {
+                        (
+                            "我的备注".into(),
+                            note.body.clone().into(),
+                            p.tone(note.tone).0,
+                        )
+                    })
+            }
+        };
+        let Some((title, text, accent)) = content else {
             return div();
         };
-        let accent = p.note_color(note.kind);
         let size = window.viewport_size();
         let width = px(382.);
         let margin = px(14.);
         let gap = px(13.);
         let below = (size.height - anchor.y - gap - px(63.)).max(px(0.));
-        let above = (anchor.y - gap - px(64.)).max(px(0.));
+        let above = (anchor.y - gap - READING_HEADER_HEIGHT).max(px(0.));
         let open_below = below >= px(220.) || below >= above;
         let height = (if open_below { below } else { above }).clamp(px(100.), px(300.));
         let left = (anchor.x - px(38.)).clamp(margin, (size.width - width - margin).max(margin));
@@ -1002,7 +1260,7 @@ impl Reader {
             .flex()
             .flex_col()
             .on_mouse_down_out(cx.listener(|reader, _, _, cx| {
-                reader.source_popup = None;
+                reader.note_popup = None;
                 cx.notify();
             }))
             .child(
@@ -1016,28 +1274,28 @@ impl Reader {
                     .gap(px(7.))
                     .child(icon(NOTE, 15., accent))
                     .child(
-                        label(note.title.clone(), 12., accent)
+                        label(title, 12., accent)
                             .font_weight(FontWeight::SEMIBOLD)
                             .flex_1(),
                     )
                     .child(
-                        icon_control("close-source-popup", CLOSE, "关闭原书注释", false, p)
+                        icon_control("close-note-popup", CLOSE, "关闭注释", false, p)
                             .size(px(25.))
                             .on_click(cx.listener(|reader, _, _, cx| {
-                                reader.source_popup = None;
+                                reader.note_popup = None;
                                 cx.notify();
                             })),
                     ),
             )
             .child(
                 div()
-                    .id("source-popup-scroll")
+                    .id("note-popup-scroll")
                     .min_h_0()
                     .overflow_y_scroll()
                     .px(px(15.))
                     .pb(px(14.))
                     .child(
-                        label(note.text.clone(), 16., p.text)
+                        label(text, 16., p.text)
                             .font_family(SERIF)
                             .line_height(px(26.)),
                     ),
@@ -1082,7 +1340,10 @@ impl Reader {
             .book
             .sections
             .get(note.passage.section)
-            .map(|data| data.title.clone())
+            .map(|_| {
+                self.book
+                    .title_at(note.passage.section, note.passage.start.block)
+            })
             .unwrap_or_default();
         style::surface(p)
             .p(px(11.))
@@ -1179,8 +1440,8 @@ impl Reader {
             );
         style::surface(p)
             .absolute()
-            .top(px(64.))
-            .right(px(45.))
+            .top(READING_HEADER_HEIGHT + px(4.))
+            .left(WINDOW_CONTROLS_INSET + px(24.))
             .w(px(266.))
             .p(px(14.))
             .shadow_lg()
@@ -1448,6 +1709,12 @@ impl Reader {
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
+        if self.shelf_dialog.is_some() {
+            if self.shelf_dialog_key(key, window, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
         if self.editor.is_some() {
             match key {
                 "escape" => {
@@ -1462,6 +1729,19 @@ impl Reader {
             }
             return;
         }
+        if self.sources.is_some() {
+            if self.sources_key(key, window, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if self.screen == Screen::Library && self.shelf_selecting && key == "escape" {
+            self.clear_shelf_selection();
+            self.focus.focus(window, cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if key == "o" && modifiers.secondary(cx) {
             self.choose_files(window, cx);
             cx.stop_propagation();
@@ -1472,6 +1752,13 @@ impl Reader {
                 self.open_library(window, cx);
             } else {
                 self.open_reader(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.screen == Screen::Plugins && key == "escape" {
+            if !self.close_plugin_settings(window, cx) {
+                self.open_library(window, cx);
             }
             cx.stop_propagation();
             return;
@@ -1490,10 +1777,11 @@ impl Reader {
             "-" if modifiers.secondary(cx) => self.size_by(-1, cx),
             "escape" => {
                 self.settings_open = false;
+                self.reading_drawer = None;
                 self.selection = None;
                 self.anchor = None;
                 self.source = None;
-                self.source_popup = None;
+                self.note_popup = None;
                 cx.notify();
             }
             "left" if !modifiers.modified() => self.turn(false, cx),
@@ -1510,11 +1798,15 @@ impl Reader {
             window.toggle_fullscreen();
             return true;
         }
-        if self.screen == Screen::Library {
+        if self.screen != Screen::Reading {
             match key {
                 "left" | "up" => window.focus_prev(cx),
                 "right" | "down" => window.focus_next(cx),
-                "enter" if self.focus.is_focused(window) && !self.busy => {
+                "enter"
+                    if self.screen == Screen::Library
+                        && self.focus.is_focused(window)
+                        && !self.busy =>
+                {
                     self.open_reader(window, cx);
                 }
                 _ => return false,
@@ -1522,12 +1814,12 @@ impl Reader {
             return true;
         }
         match key {
-            "escape" if self.source_popup.take().is_some() => cx.notify(),
+            "escape" if self.note_popup.take().is_some() => cx.notify(),
             "escape" if std::mem::take(&mut self.settings_open) => {
                 self.focus.focus(window, cx);
                 cx.notify();
             }
-            "escape" if self.handheld_panel.take().is_some() => {
+            "escape" if self.reading_drawer.take().is_some() => {
                 self.focus.focus(window, cx);
                 cx.notify();
             }
@@ -1549,20 +1841,17 @@ impl Reader {
                 }
             }
             "b" => self.toggle_bookmark(window, cx),
-            "left" | "up" if self.handheld_panel.is_some() || self.settings_open => {
+            "left" | "up" if self.reading_drawer.is_some() || self.settings_open => {
                 self.move_handheld_focus(false, window, cx);
             }
-            "right" | "down" if self.handheld_panel.is_some() || self.settings_open => {
+            "right" | "down" if self.reading_drawer.is_some() || self.settings_open => {
                 self.move_handheld_focus(true, window, cx);
             }
             "t" => {
-                self.handheld_panel = None;
-                self.source_popup = None;
-                self.settings_open = !self.settings_open;
+                self.toggle_reading_settings(cx);
                 if !self.settings_open {
                     self.focus.focus(window, cx);
                 }
-                cx.notify();
             }
             _ => return false,
         }
